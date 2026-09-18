@@ -14,6 +14,7 @@ AutoSync — основной процесс демона.
 не кладётся ни в один реальный репозиторий, только в /mnt/user-data/outputs для ревью.
 """
 
+import fnmatch
 import json
 import threading
 import time
@@ -25,6 +26,21 @@ from watchdog.observers import Observer
 import git_ops
 import notifier
 from version import Version, VALID_STATUSES, parse
+
+# Служебные/временные файлы, которые НЕ должны триггерить коммит.
+# Пример из практики: Yandex Disk пишет файлы атомарно — сначала во временный
+# ".<имя>.<pid>.<hash>.tmp", потом переименовывает в целевой файл. Событие на сам
+# переименованный файл всё равно придёт отдельно и обработается как обычно.
+IGNORE_PATTERNS = [
+    "*.tmp",
+    ".*.tmp",
+    "~$*",       # временные файлы Office и похожих программ
+    "*.godot.import",
+]
+
+
+def _is_ignored(filename: str) -> bool:
+    return any(fnmatch.fnmatch(filename, pattern) for pattern in IGNORE_PATTERNS)
 
 
 class RepoWatcher(FileSystemEventHandler):
@@ -39,6 +55,9 @@ class RepoWatcher(FileSystemEventHandler):
 
     def on_modified(self, event):
         if event.is_directory:
+            return
+        filename = Path(event.src_path).name
+        if _is_ignored(filename):
             return
         self._sync(reason=f"изменён файл: {event.src_path}")
 
