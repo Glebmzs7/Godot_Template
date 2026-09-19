@@ -49,8 +49,8 @@ from watchdog.observers import Observer
 import git_ops
 import notifier
 import state
+import version
 from gui import AutoSyncGUI, remote_to_github_web_url
-from version import Version, parse
 
 REASON_START = "Запуск"
 REASON_PUSH = "Пуш"
@@ -213,35 +213,30 @@ class RepoWatcher(FileSystemEventHandler):
         self.last_action = "обновлено с git"
         log(self.name, f"Результат: обновлено с git до {git_version}")
 
-    def _next_version(self) -> Version:
-        base = self.known_version or self.current_tag
-        if not base or base == "тегов ещё нет":
-            return Version(
-                stable=0, stable_patch=0, beta=0, beta_push=0,
-                dev_id=self.dev_id, task_label=0, push_count=0,
-            )
-        prev = parse(base)
-        return Version(
-            stable=prev.stable, stable_patch=prev.stable_patch,
-            beta=prev.beta, beta_push=prev.beta_push,
-            dev_id=self.dev_id, task_label=prev.task_label, push_count=prev.push_count + 1,
-            project_sync=prev.project_sync,
-        )
+    def manual_set_version(self, new_prefix: str) -> None:
+        """Ручное изменение версии — разработчик просто вписывает любой текст (никакого формата
+        не требуется, хоть 'HJDF3123Hj0'), push_count при этом обнуляется и дальше снова растёт
+        сам по +1 на каждый пуш.
 
-    def manual_set_version(self, new_version: Version) -> None:
-        """Ручное изменение версии (разработчик сам двигает Stable/Beta/task_label и т.п.) —
-        push_count при этом всегда обнуляется: это начало нового отрезка версий, дальше он снова
-        растёт автоматически по +1 на каждый пуш, как обычно. Изменение сразу же коммитится и
-        пушится (с явным сообщением о ручном изменении версии), даже если файлы не менялись —
-        сам факт смены версии должен попасть в git."""
-        new_version.push_count = 0
+        Это осознанно принудительное действие (force-with-lease) — сделано так, а не с отказом
+        при расхождении: если разработчик явно вписал версию и нажал "Применить", значит его
+        решение и есть новая истина, независимо от того, что раньше застряло на git (в том числе
+        если там повис старый некорректный тег, который иначе было не поправить из программы)."""
         with self._lock:
+            log(self.name, f"Ручное изменение версии на {new_prefix!r}...")
+            try:
+                git_ops.fetch(self.repo_path)
+            except git_ops.GitError as e:
+                self.last_action = "нет связи с git — версия не изменена"
+                log(self.name, f"Ручное изменение версии отменено: нет связи с git — {e}")
+                return
             self._action_push(
-                reason=f"Ручное обновление версии: {new_version.format()}",
-                explicit_version=new_version,
+                reason=f"Ручное обновление версии: {new_prefix}",
+                force=True,
+                explicit_prefix=new_prefix,
             )
 
-    def _action_push(self, reason: str, force: bool = False, explicit_version: Optional[Version] = None) -> None:
+    def _action_push(self, reason: str, force: bool = False, explicit_prefix: Optional[str] = None) -> None:
         self.last_action = "передаём синхронизацию..."
         log(self.name, "Передаём синхронизацию (commit + push)...")
 
@@ -258,19 +253,29 @@ class RepoWatcher(FileSystemEventHandler):
             log(self.name, f"Результат: ошибка при коммите/пуше — {e}")
             return
 
-        # При ручном изменении версии используем версию, которую задал разработчик, а не
-        # автоматически посчитанную следующую — но если её тег вдруг уже занят, всё равно не
-        # сдаёмся (см. цикл ниже), просто едем по push_count дальше от неё.
-        version = explicit_version if explicit_version is not None else self._next_version()
+        # Версия — это просто префикс (любой текст) + свой номер пуша (version.py). При ручном
+        # изменении префикс задан явно и push_count начинается с 0; иначе берём то, что уже
+        # знаем, и увеличиваем номер пуша на 1. Если конкретный тег вдруг уже занят на git — не
+        # сдаёмся (см. цикл ниже), просто едем по номеру пуша дальше.
+        if explicit_prefix is not None:
+            prefix, push_count = explicit_prefix, 0
+        else:
+            base = self.known_version or self.current_tag
+            if not base or base == "тегов ещё нет":
+                prefix, push_count = str(self.dev_id), 0
+            else:
+                prefix, prev_push = version.split_prefix_and_push(base)
+                push_count = prev_push + 1
+
         tag = None
         for _ in range(50):
-            tag = version.format()
+            candidate = version.build_tag(prefix, push_count)
             try:
-                git_ops.create_and_push_tag(self.repo_path, tag, message=reason)
+                git_ops.create_and_push_tag(self.repo_path, candidate, message=reason)
+                tag = candidate
                 break
             except git_ops.GitError:
-                version.push_count += 1
-                tag = None
+                push_count += 1
         if tag is None:
             self.last_check_time = _now_str()
             self.last_action = "пуш прошёл, тег не поставлен"
@@ -366,10 +371,10 @@ def edit_repo_runtime(watcher: RepoWatcher, branch: Optional[str] = None,
     log(watcher.name, "Настройки репозитория изменены")
 
 
-def manual_version_change_runtime(watcher: RepoWatcher, new_version: Version) -> None:
+def manual_version_change_runtime(watcher: RepoWatcher, new_prefix: str) -> None:
     """Вызывается из окна ('Изменить версию...') — сама git-операция идёт в фоновом потоке,
     чтобы не подвешивать окно на время commit+push."""
-    threading.Thread(target=watcher.manual_set_version, args=(new_version,), daemon=True).start()
+    threading.Thread(target=watcher.manual_set_version, args=(new_prefix,), daemon=True).start()
 
 
 def periodic_check_loop(watchers: list) -> None:

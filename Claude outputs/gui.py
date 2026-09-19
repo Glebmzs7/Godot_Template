@@ -91,18 +91,24 @@ class RepoRow(tk.Frame):
         self.watcher = watcher
         self.app = app
 
-        self.path_label = tk.Label(self, cursor="hand2", anchor="w", width=28)
-        self.path_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        # Колонки растягиваются РАВНОМЕРНО (uniform) вместе с окном — раньше ширина была
+        # фиксированной в символах, и при узком окне текст последних колонок просто уезжал за
+        # пределы видимой области (не было ни переноса, ни горизонтальной прокрутки).
+        for col in range(5):
+            self.grid_columnconfigure(col, weight=1, uniform="repo_row_cols")
+
+        self.path_label = tk.Label(self, cursor="hand2", anchor="w")
+        self.path_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.path_label.bind("<Button-1>", lambda e: _open_in_explorer(self.watcher.full_watch_path))
         self.path_label.bind("<Button-3>", self._path_menu)
 
-        self.git_label = tk.Label(self, cursor="hand2", anchor="w", width=28, fg="#1a5fb4")
-        self.git_label.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.git_label = tk.Label(self, cursor="hand2", anchor="w", fg="#1a5fb4")
+        self.git_label.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.git_label.bind("<Button-1>", self._open_git)
         self.git_label.bind("<Button-3>", self._git_menu)
 
         self.version_frame = tk.Frame(self)
-        self.version_frame.grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.version_frame.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         self.version_prefix_label = tk.Label(self.version_frame, anchor="w")
         self.version_prefix_label.pack(side="left")
         self.version_push_label = tk.Label(self.version_frame, anchor="w", fg="#1a5fb4", font=("TkDefaultFont", 9, "bold"))
@@ -110,15 +116,16 @@ class RepoRow(tk.Frame):
         for widget in (self.version_frame, self.version_prefix_label, self.version_push_label):
             widget.bind("<Button-3>", self._version_menu)
 
-        self.saved_label = tk.Label(self, anchor="w", width=20)
-        self.saved_label.grid(row=0, column=3, sticky="w", padx=(0, 8))
+        # Последние две колонки (время/отсчёт) — текст прижат вправо, к краю строки, а не влево.
+        self.saved_label = tk.Label(self, anchor="e")
+        self.saved_label.grid(row=0, column=3, sticky="ew", padx=(0, 8))
 
-        self.countdown_label = tk.Label(self, anchor="w", width=16, cursor="hand2")
-        self.countdown_label.grid(row=0, column=4, sticky="w")
+        self.countdown_label = tk.Label(self, anchor="e", cursor="hand2")
+        self.countdown_label.grid(row=0, column=4, sticky="ew")
         self.countdown_label.bind("<Button-3>", self._interval_menu)
 
         self.status_label = tk.Label(self, anchor="w")
-        self.status_label.grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        self.status_label.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(2, 0))
 
         for widget in (self, self.status_label, self.saved_label):
             widget.bind("<Button-1>", self._row_click, add="+")
@@ -148,58 +155,39 @@ class RepoRow(tk.Frame):
         menu.tk_popup(event.x_root, event.y_root)
 
     def _edit_version(self) -> None:
-        from version import Version, parse as parse_version
+        from version import split_prefix_and_push
 
-        base = self.watcher.known_version
-        try:
-            prev = parse_version(base) if base else None
-        except ValueError:
-            prev = None
+        base = self.watcher.known_version or self.watcher.current_tag
+        if base and base != "тегов ещё нет":
+            default_prefix, _ = split_prefix_and_push(base)
+        else:
+            default_prefix = str(self.watcher.dev_id)
 
         win = tk.Toplevel(self)
         win.title(f"Изменить версию — {self.watcher.name}")
         tk.Label(
             win,
-            text="Последнее число (номер пуша) вы не задаёте — оно всегда обнулится и дальше\n"
-                 "снова будет расти автоматически с каждым пушем.",
+            text="Версия — любой текст, никакого формата не требуется. Номер пуша в конце вы не\n"
+                 "задаёте — он обнулится и дальше снова будет расти сам с каждым пушем.\n"
+                 "Применяется сразу: коммит + пуш поверх того, что сейчас на git.",
             justify="left",
-        ).grid(row=0, column=0, columnspan=2, padx=8, pady=(8, 4), sticky="w")
+        ).pack(padx=12, pady=(12, 6), anchor="w")
 
-        labels = ["Stable", "StablePatch", "Beta", "BetaPush", "DevId", "TaskLabel"]
-        keys = ["stable", "stable_patch", "beta", "beta_push", "dev_id", "task_label"]
-        defaults = {
-            "stable": prev.stable if prev else 0,
-            "stable_patch": prev.stable_patch if prev else 0,
-            "beta": prev.beta if prev else 0,
-            "beta_push": prev.beta_push if prev else 0,
-            "dev_id": prev.dev_id if prev else self.watcher.dev_id,
-            "task_label": prev.task_label if prev else 0,
-        }
-        entries = {}
-        for i, (label, key) in enumerate(zip(labels, keys), start=1):
-            tk.Label(win, text=label).grid(row=i, column=0, sticky="w", padx=8, pady=2)
-            entry = tk.Entry(win, width=10)
-            entry.insert(0, str(defaults[key]))
-            entry.grid(row=i, column=1, sticky="w", padx=8, pady=2)
-            entries[key] = entry
+        entry = tk.Entry(win, width=48)
+        entry.insert(0, default_prefix)
+        entry.pack(padx=12, pady=(0, 12), fill="x")
+        entry.select_range(0, "end")
+        entry.focus_set()
 
         def submit():
-            try:
-                values = {k: int(e.get().strip()) for k, e in entries.items()}
-            except ValueError:
+            new_prefix = entry.get().strip()
+            if not new_prefix:
                 return
-            new_version = Version(
-                stable=values["stable"], stable_patch=values["stable_patch"],
-                beta=values["beta"], beta_push=values["beta_push"],
-                dev_id=values["dev_id"], task_label=values["task_label"],
-                push_count=0, project_sync=prev.project_sync if prev else None,
-            )
-            self.app.manual_version_change(self.watcher, new_version)
+            self.app.manual_version_change(self.watcher, new_prefix)
             win.destroy()
 
-        tk.Button(win, text="Применить (коммит + пуш сразу)", command=submit).grid(
-            row=len(labels) + 1, column=0, columnspan=2, pady=10
-        )
+        entry.bind("<Return>", lambda e: submit())
+        tk.Button(win, text="Применить (коммит + пуш сразу)", command=submit).pack(pady=(0, 12))
 
     def _interval_menu(self, event):
         menu = tk.Menu(self, tearoff=0)
@@ -302,7 +290,11 @@ class AutoSyncGUI:
         scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
         self.rows_frame = tk.Frame(canvas)
         self.rows_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
+        rows_window = canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
+        # Ширина содержимого канваса всегда равна ширине окна — иначе при изменении размера окна
+        # строки не растягивались вслед за ним, и правые колонки "уезжали" за пределы видимой
+        # области без возможности прокрутить (только вертикальная прокрутка и была нужна).
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(rows_window, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
