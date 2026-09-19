@@ -36,6 +36,10 @@ from notifier import SyncChoice
 
 _MAX_LOG_LINES = 300
 
+# Журнал теперь не только в окне (которое каждый раз при перезапуске начинается с чистого листа),
+# но и в файле рядом с программой — жалоба "вывод в консоль не сохраняется из сессии в сессию".
+_LOG_FILE_PATH = Path(__file__).resolve().parent / "autosync.log"
+
 
 def _last_n_path_parts(path: Path, n: int = 3) -> str:
     parts = path.parts[-n:] if len(path.parts) >= n else path.parts
@@ -129,6 +133,7 @@ class RepoRow(tk.Frame):
 
         for widget in (self, self.status_label, self.saved_label):
             widget.bind("<Button-1>", self._row_click, add="+")
+            widget.bind("<Button-3>", self._row_menu, add="+")
 
         self.pack(fill="x", padx=6, pady=3)
 
@@ -236,6 +241,57 @@ class RepoRow(tk.Frame):
         if self.watcher.pending_question is not None:
             self.app.reopen_pending(self.watcher)
 
+    def _row_menu(self, event) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Изменить репозиторий...", command=self._edit_repo_full)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _edit_repo_full(self) -> None:
+        """Правая кнопка мыши на строке (не на конкретной ссылке/версии/интервале — там свои
+        отдельные меню) — открывает окно, аналогичное добавлению репозитория, но с уже
+        подставленными данными этой строки, включая имя (раньше имя было неизменяемым)."""
+        w = self.watcher
+        win = tk.Toplevel(self)
+        win.title(f"Изменить репозиторий — {w.name}")
+
+        rows = [
+            ("path", "Папка хранения (где лежит .git)", str(w.repo_path)),
+            ("branch", "Ветка для push", w.branch),
+            ("interval", "Через сколько секунд проверять git", str(w.check_interval_seconds)),
+            ("name", "Имя", w.name),
+            ("watch_path", "Папка слежения внутри репозитория (пусто — вся папка)", w.watch_paths[0]),
+        ]
+        fields = {}
+        for i, (key, label, current) in enumerate(rows):
+            tk.Label(win, text=label, wraplength=260, justify="left").grid(
+                row=i, column=0, sticky="w", padx=8, pady=4
+            )
+            entry = tk.Entry(win, width=40)
+            entry.insert(0, current)
+            entry.grid(row=i, column=1, padx=8, pady=4)
+            fields[key] = entry
+
+        def submit():
+            path = fields["path"].get().strip()
+            branch = fields["branch"].get().strip()
+            name = fields["name"].get().strip()
+            watch_path = fields["watch_path"].get().strip()
+            if not (path and branch and name):
+                return
+            try:
+                interval_seconds = int(fields["interval"].get().strip())
+            except ValueError:
+                interval_seconds = w.check_interval_seconds
+            self.app.on_edit_repo(
+                w, name=name, path=path, branch=branch,
+                watch_path=watch_path, interval_seconds=interval_seconds,
+            )
+            win.destroy()
+
+        tk.Button(win, text="Сохранить", command=submit).grid(
+            row=len(rows), column=0, columnspan=2, pady=10
+        )
+
     # --- обновление вида -----------------------------------------------------------
 
     def refresh(self) -> None:
@@ -325,16 +381,43 @@ class AutoSyncGUI:
 
         self.filter_mode = False
         self._rows: dict = {}
+        self._log_lock = threading.Lock()
         for w in watchers:
             self._add_row(w)
 
+        self._load_log_history()
         self._tick()
 
     # --- вызывается из фоновых потоков (watcher.py) -----------------------------
 
     def log(self, repo_name: str, message: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] [{repo_name}] {message}"
+        self._append_log_file(line)
         self.root.after(0, self._append_log, line)
+
+    def _append_log_file(self, line: str) -> None:
+        with self._log_lock:
+            try:
+                with open(_LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass  # запись в файл — не критично, окно всё равно должно работать дальше
+
+    def _load_log_history(self) -> None:
+        """При старте подтягиваем хвост лога с прошлых сессий, чтобы окно не начиналось с
+        пустоты — раньше весь журнал терялся при каждом перезапуске программы."""
+        try:
+            lines = _LOG_FILE_PATH.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        if not lines:
+            return
+        tail = lines[-_MAX_LOG_LINES:]
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", "\n".join(tail) + "\n")
+        self.log_text.insert("end", "── новый запуск программы ──\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
     def ask_yes_no(self, watcher, message: str) -> bool:
         pq = PendingQuestion(kind="yes_no", message=message)
@@ -432,7 +515,9 @@ class AutoSyncGUI:
 
     def _add_row(self, watcher) -> None:
         row = RepoRow(self.rows_frame, watcher, self)
-        self._rows[watcher.name] = row
+        # Ключ — сам объект watcher (id), а не watcher.name: имя теперь можно менять через
+        # "Изменить репозиторий...", и по строковому имени строка была бы потеряна после смены.
+        self._rows[id(watcher)] = row
 
     def _toggle_filter(self) -> None:
         self.filter_mode = not self.filter_mode
@@ -440,7 +525,7 @@ class AutoSyncGUI:
 
     def _apply_filter(self) -> None:
         for w in self.watchers:
-            row = self._rows.get(w.name)
+            row = self._rows.get(id(w))
             if row is None:
                 continue
             show = (not self.filter_mode) or (w.pending_question is not None)
@@ -504,7 +589,7 @@ class AutoSyncGUI:
             self._add_row(watcher)
             win.destroy()
 
-        tk.Button(win, text="Добавить", command=submit).grid(row=len(labels), column=0, columnspan=2, pady=10)
+        tk.Button(win, text="Добавить", command=submit).grid(row=len(rows), column=0, columnspan=2, pady=10)
 
     def on_edit_repo(self, watcher, **changes) -> None:
         self._on_edit_repo_cb(watcher, **changes)
@@ -514,12 +599,14 @@ class AutoSyncGUI:
 
     def _tick(self) -> None:
         pending_count = sum(1 for w in self.watchers if w.pending_question is not None)
-        self.alert_button.configure(text=f"ПРОБЛЕМЫ ({pending_count})" if pending_count else "")
+        # Раньше при 0 проблем кнопка вообще исчезала ("ПРОБЛЕМЫ (0)" не было видно совсем) —
+        # теперь кнопка всегда на месте, просто со счётчиком.
+        self.alert_button.configure(text=f"ПРОБЛЕМЫ ({pending_count})")
         if self.filter_mode and pending_count == 0:
             self.filter_mode = False
         self._apply_filter()
         for w in self.watchers:
-            row = self._rows.get(w.name)
+            row = self._rows.get(id(w))
             if row is not None:
                 row.refresh()
         self.root.after(500, self._tick)

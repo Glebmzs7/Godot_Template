@@ -98,6 +98,12 @@ class RepoWatcher(FileSystemEventHandler):
         self.check_interval_seconds = check_interval_seconds
         self.next_check_at = time.time() + self.check_interval_seconds
 
+        # Работает/остановлена — ручной переключатель (кнопка в строке окна), сохраняется в
+        # config.json как "enabled", чтобы состояние переживало перезапуск программы. Старых
+        # config.json без этого поля это не касается — по умолчанию считаем, что репозиторий
+        # запущен (как было всегда).
+        self.running: bool = repo_cfg.get("enabled", True)
+
         # known_version — версия, которую мы сами приняли/подтвердили в прошлый раз (state.py).
         # current_tag — что реально сейчас стоит на git, только для отображения в окне.
         self.known_version: Optional[str] = state.load_known_version(self.name)
@@ -130,6 +136,8 @@ class RepoWatcher(FileSystemEventHandler):
     # --- события файловой системы ------------------------------------------------
 
     def on_modified(self, event):
+        if not self.running:
+            return  # на всякий случай — по идее watch уже снят, событие сюда не должно прийти
         if event.is_directory:
             return
         filename = Path(event.src_path).name
@@ -147,7 +155,11 @@ class RepoWatcher(FileSystemEventHandler):
 
             try:
                 git_ops.fetch(self.repo_path)
-                git_version = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
+                # Смотрим тег именно на origin/<branch> (реально то, что на git ПОСЛЕ fetch), а
+                # не на локальной ветке — fetch сам по себе локальную ветку не двигает, поэтому
+                # раньше здесь можно было увидеть устаревший тег и решить, что "версии совпали",
+                # хотя реально git уже ушёл вперёд (или наоборот).
+                git_version = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
             except git_ops.GitError as e:
                 self._action_error_connection(reason, e)
                 return
@@ -284,7 +296,7 @@ class RepoWatcher(FileSystemEventHandler):
 
         try:
             git_ops.fetch(self.repo_path)
-            confirmed = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
+            confirmed = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
         except git_ops.GitError as e:
             self.last_action = "ошибка проверки после пуша"
             log(self.name, f"Результат: пуш прошёл, но проверка после пуша не удалась — {e}")
@@ -311,7 +323,7 @@ class RepoWatcher(FileSystemEventHandler):
             return
         elif choice == notifier.SyncChoice.TAKE_GIT:
             log(self.name, "Выбор пользователя: взять версию с git")
-            git_version = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
+            git_version = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
             if git_version:
                 self._action_update_local(git_version)
         else:
@@ -351,24 +363,74 @@ def add_repo_runtime(repo_cfg: dict, interval_seconds: int):
     return watcher
 
 
-def edit_repo_runtime(watcher: RepoWatcher, branch: Optional[str] = None,
-                       watch_path: Optional[str] = None) -> None:
-    """Вызывается из окна (пункты 'Изменить...' в контекстных меню)."""
+def edit_repo_runtime(watcher: RepoWatcher, name: Optional[str] = None, path: Optional[str] = None,
+                       branch: Optional[str] = None, watch_path: Optional[str] = None,
+                       interval_seconds: Optional[int] = None) -> None:
+    """Вызывается из окна (отдельные пункты 'Изменить...' в контекстных меню, и полное окно
+    'Изменить репозиторий...' по правому клику на строке — оно может прислать сразу все поля)."""
+    old_name = watcher.name
     for repo_cfg in cfg.get("repos", []):
-        if repo_cfg["name"] != watcher.name:
+        if repo_cfg["name"] != old_name:
             continue
+
+        needs_rewatch = bool(path) or (watch_path is not None)
+        if needs_rewatch:
+            _unregister_watch(watcher)
+
+        if name and name != old_name:
+            watcher.name = name
+            repo_cfg["name"] = name
+            # известная версия хранится в state.json по имени — переносим на новое, чтобы
+            # переименование не выглядело как "версия сбросилась"
+            known = state.load_known_version(old_name)
+            if known is not None:
+                state.save_known_version(name, known)
+        if path:
+            watcher.repo_path = Path(path)
+            repo_cfg["path"] = path
+            watcher._remote_url_cache = None
         if branch:
             watcher.branch = branch
             repo_cfg["branch"] = branch
             watcher._remote_url_cache = None
-        if watch_path:
-            _unregister_watch(watcher)
+        if watch_path is not None:  # пустая строка — осознанный выбор "следить за всей папкой"
             watcher.watch_paths = [watch_path]
             repo_cfg["watch_paths"] = [watch_path]
+        if interval_seconds:
+            watcher.check_interval_seconds = interval_seconds
+            watcher.next_check_at = time.time() + interval_seconds
+
+        if needs_rewatch:
             _register_watch(watcher)
         break
     _save_config()
     log(watcher.name, "Настройки репозитория изменены")
+
+
+def set_repo_running_runtime(watcher: RepoWatcher, running: bool) -> None:
+    """Кнопка в строке окна (зелёная 'Работает' / красная 'Остановлена'). При остановке снимаем
+    слежение watchdog и репозиторий просто пропускается в периодических проверках — не трогаем
+    известную версию и ничего не пушим. При включении — сразу перерегистрируем слежение и
+    запускаем проверку, как при старте программы. Состояние сохраняется в config.json, чтобы
+    пережить перезапуск."""
+    for repo_cfg in cfg.get("repos", []):
+        if repo_cfg["name"] == watcher.name:
+            repo_cfg["enabled"] = running
+            break
+    _save_config()
+
+    watcher.running = running
+    if running:
+        _register_watch(watcher)
+        watcher.next_check_at = time.time() + watcher.check_interval_seconds
+        log(watcher.name, "Репозиторий включён — слежение возобновлено")
+        threading.Thread(
+            target=_run_check, args=(watcher, REASON_START, "Проверка после включения..."),
+            daemon=True,
+        ).start()
+    else:
+        _unregister_watch(watcher)
+        log(watcher.name, "Репозиторий остановлен пользователем — слежение и проверки приостановлены")
 
 
 def manual_version_change_runtime(watcher: RepoWatcher, new_prefix: str) -> None:
@@ -377,31 +439,64 @@ def manual_version_change_runtime(watcher: RepoWatcher, new_prefix: str) -> None
     threading.Thread(target=watcher.manual_set_version, args=(new_prefix,), daemon=True).start()
 
 
+def _run_check(w: "RepoWatcher", reason: str, start_message: str) -> None:
+    log(w.name, start_message)
+    w.sverka_versiy(reason)
+
+
 def periodic_check_loop(watchers: list) -> None:
+    # Раньше проверка каждого репозитория шла здесь же, синхронно, одна за другой. Если у
+    # какого-то репозитория sverka_versiy зависала на вопросе пользователю (ask_yes_no/ask_choice
+    # блокируют поток до ответа), весь цикл вставал — остальные репозитории тоже переставали
+    # проверяться по расписанию, и обратный отсчёт у них визуально "замирал". Теперь каждая
+    # сработавшая проверка уходит в свой отдельный поток, и ожидание ответа по одному репозиторию
+    # не мешает ни таймерам, ни проверкам остальных.
     while True:
         time.sleep(1)
         now = time.time()
         for w in watchers:
+            if not w.running:
+                continue  # остановлен пользователем — пропускаем, таймер не двигаем
             if now >= w.next_check_at:
                 w.next_check_at = now + w.check_interval_seconds
-                log(w.name, "Плановая (периодическая) проверка...")
-                w.sverka_versiy(REASON_START)
+                threading.Thread(
+                    target=_run_check, args=(w, REASON_START, "Плановая (периодическая) проверка..."),
+                    daemon=True,
+                ).start()
 
 
 def _background_start(watchers: list) -> None:
     for w in watchers:
-        _register_watch(w)
+        if w.running:
+            _register_watch(w)
     observer.start()
 
+    # Первичная проверка каждого репозитория — тоже в своём потоке (см. периодический цикл выше):
+    # раньше эти проверки шли последовательно ЗДЕСЬ, и если первый же репозиторий на старте
+    # упирался в вопрос пользователю, поток periodic_check_loop вообще не запускался, пока на
+    # этот вопрос кто-то не ответит — снаружи это выглядело как "программа зависла, отсчёт не
+    # идёт". Теперь periodic_check_loop стартует сразу, независимо от того, ждут ли ответа
+    # какие-то репозитории.
     for w in watchers:
-        log(w.name, "Первичная проверка синхронизации с GitHub...")
-        w.sverka_versiy(REASON_START)
+        if not w.running:
+            continue
+        threading.Thread(
+            target=_run_check, args=(w, REASON_START, "Первичная проверка синхронизации с GitHub..."),
+            daemon=True,
+        ).start()
 
     threading.Thread(target=periodic_check_loop, args=(watchers,), daemon=True).start()
 
 
-def main(config_path_: str = "config.json") -> None:
+def main(config_path_: Optional[str] = None) -> None:
     global app, observer, cfg, config_path
+    if config_path_ is None:
+        # По умолчанию config.json ищем РЯДОМ С САМИМ watcher.py, а не в текущей рабочей папке —
+        # раньше относительный путь "config.json" резолвился от того, откуда был запущен процесс,
+        # и при запуске программы не из её собственной папки (например ярлыком, или если файлы
+        # случайно оказались скопированы в другое место) она не находила свой config.json и
+        # падала с FileNotFoundError, хотя реально файл лежал рядом с watcher.py/AutoSync.pyw.
+        config_path_ = str(Path(__file__).resolve().parent / "config.json")
     config_path = config_path_
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     dev_id = cfg["dev_id"]
@@ -417,6 +512,7 @@ def main(config_path_: str = "config.json") -> None:
         on_add_repo=add_repo_runtime,
         on_edit_repo=edit_repo_runtime,
         on_manual_version_change=manual_version_change_runtime,
+        on_toggle_run=set_repo_running_runtime,
     )
 
     # Слежение и проверки идут в фоне, окно — на главном потоке (обязательное требование tkinter).

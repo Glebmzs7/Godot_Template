@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "C:\Users\Бог\YandexDisk-volov7gleb\Проекты\IT\Godot_Template\Claude outputs\AutoSync.pyw", line 49, in <module>
+    watcher.main()
+  File "C:\Users\Бог\YandexDisk-volov7gleb\Проекты\IT\Godot_Template\Claude outputs\watcher.py", line 109, in main
+    cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Бог\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1027, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Бог\AppData\Local\Programs\Python\Python312\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'config.json'

@@ -36,6 +36,10 @@ from notifier import SyncChoice
 
 _MAX_LOG_LINES = 300
 
+# Журнал теперь не только в окне (которое каждый раз при перезапуске начинается с чистого листа),
+# но и в файле рядом с программой — жалоба "вывод в консоль не сохраняется из сессии в сессию".
+_LOG_FILE_PATH = Path(__file__).resolve().parent / "autosync.log"
+
 
 def _last_n_path_parts(path: Path, n: int = 3) -> str:
     parts = path.parts[-n:] if len(path.parts) >= n else path.parts
@@ -94,7 +98,8 @@ class RepoRow(tk.Frame):
         # Колонки растягиваются РАВНОМЕРНО (uniform) вместе с окном — раньше ширина была
         # фиксированной в символах, и при узком окне текст последних колонок просто уезжал за
         # пределы видимой области (не было ни переноса, ни горизонтальной прокрутки).
-        for col in range(5):
+        # Колонка 5 — кнопка работает/ожидает/остановлена.
+        for col in range(6):
             self.grid_columnconfigure(col, weight=1, uniform="repo_row_cols")
 
         self.path_label = tk.Label(self, cursor="hand2", anchor="w")
@@ -121,11 +126,17 @@ class RepoRow(tk.Frame):
         self.saved_label.grid(row=0, column=3, sticky="ew", padx=(0, 8))
 
         self.countdown_label = tk.Label(self, anchor="e", cursor="hand2")
-        self.countdown_label.grid(row=0, column=4, sticky="ew")
+        self.countdown_label.grid(row=0, column=4, sticky="ew", padx=(0, 8))
         self.countdown_label.bind("<Button-3>", self._interval_menu)
 
+        # Работает (зелёная) / Ожидает (жёлтая — есть вопрос, требующий ответа, клик открывает
+        # тот же диалог, что и клик по красной строке) / Остановлена (красная — слежение и
+        # проверки для этого репозитория выключены пользователем, до повторного включения).
+        self.run_button = tk.Button(self, width=12, command=self._on_run_button_click)
+        self.run_button.grid(row=0, column=5, sticky="ew")
+
         self.status_label = tk.Label(self, anchor="w")
-        self.status_label.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(2, 0))
+        self.status_label.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(2, 0))
 
         for widget in (self, self.status_label, self.saved_label):
             widget.bind("<Button-1>", self._row_click, add="+")
@@ -233,6 +244,17 @@ class RepoRow(tk.Frame):
             self.watcher.check_interval_seconds = seconds
             self.watcher.next_check_at = time.time() + self.watcher.check_interval_seconds
 
+    def _on_run_button_click(self) -> None:
+        w = self.watcher
+        if w.pending_question is not None:
+            # Жёлтое состояние — это не переключатель, а напоминание об открытом вопросе: клик
+            # открывает тот же диалог заново, ровно как клик по красной строке.
+            self.app.reopen_pending(w)
+        elif w.running:
+            self.app.on_toggle_run(w, False)
+        else:
+            self.app.on_toggle_run(w, True)
+
     def _row_click(self, _event=None) -> None:
         if self.watcher.pending_question is not None:
             self.app.reopen_pending(self.watcher)
@@ -307,10 +329,16 @@ class RepoRow(tk.Frame):
         self.saved_label.configure(text=w.last_saved_at)
         remaining = max(0, int(w.next_check_at - time.time()))
         mm, ss = divmod(remaining, 60)
-        self.countdown_label.configure(text=f"{mm:02d}:{ss:02d}")
+        self.countdown_label.configure(text=f"{mm:02d}:{ss:02d}" if w.running else "—:—")
         self.status_label.configure(text=f"{w.last_action} ({w.last_check_time})")
 
         needs_attention = w.pending_question is not None
+        if needs_attention:
+            self.run_button.configure(text="Ожидает", bg="#f6c343", activebackground="#f6c343")
+        elif w.running:
+            self.run_button.configure(text="Работает", bg="#4caf50", activebackground="#4caf50")
+        else:
+            self.run_button.configure(text="Остановлена", bg="#e05252", activebackground="#e05252")
         bg = "#f8d7da" if needs_attention else self.app.default_bg
         for widget in (self, self.status_label, self.saved_label, self.countdown_label,
                        self.version_frame, self.version_prefix_label, self.version_push_label,
@@ -321,11 +349,13 @@ class RepoRow(tk.Frame):
 class AutoSyncGUI:
     def __init__(self, watchers: list, on_add_repo: Callable[[dict], object],
                  on_edit_repo: Callable[..., None],
-                 on_manual_version_change: Callable[..., None]):
+                 on_manual_version_change: Callable[..., None],
+                 on_toggle_run: Callable[..., None]):
         self.watchers = watchers
         self._on_add_repo_cb = on_add_repo
         self._on_edit_repo_cb = on_edit_repo
         self._on_manual_version_change_cb = on_manual_version_change
+        self._on_toggle_run_cb = on_toggle_run
 
         self.root = tk.Tk()
         self.root.title("AutoSync")
@@ -377,16 +407,43 @@ class AutoSyncGUI:
 
         self.filter_mode = False
         self._rows: dict = {}
+        self._log_lock = threading.Lock()
         for w in watchers:
             self._add_row(w)
 
+        self._load_log_history()
         self._tick()
 
     # --- вызывается из фоновых потоков (watcher.py) -----------------------------
 
     def log(self, repo_name: str, message: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] [{repo_name}] {message}"
+        self._append_log_file(line)
         self.root.after(0, self._append_log, line)
+
+    def _append_log_file(self, line: str) -> None:
+        with self._log_lock:
+            try:
+                with open(_LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass  # запись в файл — не критично, окно всё равно должно работать дальше
+
+    def _load_log_history(self) -> None:
+        """При старте подтягиваем хвост лога с прошлых сессий, чтобы окно не начиналось с
+        пустоты — раньше весь журнал терялся при каждом перезапуске программы."""
+        try:
+            lines = _LOG_FILE_PATH.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        if not lines:
+            return
+        tail = lines[-_MAX_LOG_LINES:]
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", "\n".join(tail) + "\n")
+        self.log_text.insert("end", "── новый запуск программы ──\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
     def ask_yes_no(self, watcher, message: str) -> bool:
         pq = PendingQuestion(kind="yes_no", message=message)
@@ -558,7 +615,7 @@ class AutoSyncGUI:
             self._add_row(watcher)
             win.destroy()
 
-        tk.Button(win, text="Добавить", command=submit).grid(row=len(labels), column=0, columnspan=2, pady=10)
+        tk.Button(win, text="Добавить", command=submit).grid(row=len(rows), column=0, columnspan=2, pady=10)
 
     def on_edit_repo(self, watcher, **changes) -> None:
         self._on_edit_repo_cb(watcher, **changes)
@@ -566,9 +623,14 @@ class AutoSyncGUI:
     def manual_version_change(self, watcher, new_version) -> None:
         self._on_manual_version_change_cb(watcher, new_version)
 
+    def on_toggle_run(self, watcher, running: bool) -> None:
+        self._on_toggle_run_cb(watcher, running)
+
     def _tick(self) -> None:
         pending_count = sum(1 for w in self.watchers if w.pending_question is not None)
-        self.alert_button.configure(text=f"ПРОБЛЕМЫ ({pending_count})" if pending_count else "")
+        # Раньше при 0 проблем кнопка вообще исчезала ("ПРОБЛЕМЫ (0)" не было видно совсем) —
+        # теперь кнопка всегда на месте, просто со счётчиком.
+        self.alert_button.configure(text=f"ПРОБЛЕМЫ ({pending_count})")
         if self.filter_mode and pending_count == 0:
             self.filter_mode = False
         self._apply_filter()
