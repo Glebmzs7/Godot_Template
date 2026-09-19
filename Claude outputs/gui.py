@@ -222,12 +222,14 @@ class RepoRow(tk.Frame):
             self.app.on_edit_repo(self.watcher, branch=new_value)
 
     def _set_interval(self) -> None:
-        minutes = simpledialog.askinteger(
-            "Интервал проверки", f"Через сколько минут проверять «{self.watcher.name}»?",
-            initialvalue=max(1, self.watcher.check_interval_seconds // 60), minvalue=1, parent=self,
+        # В секундах и обязательно целым числом — проще, чем возиться с разделителем дробной
+        # части (запятая/точка путаются в разных региональных настройках Windows).
+        seconds = simpledialog.askinteger(
+            "Интервал проверки", f"Через сколько секунд проверять «{self.watcher.name}»?",
+            initialvalue=self.watcher.check_interval_seconds, minvalue=1, parent=self,
         )
-        if minutes:
-            self.watcher.check_interval_seconds = minutes * 60
+        if seconds:
+            self.watcher.check_interval_seconds = seconds
             self.watcher.next_check_at = time.time() + self.watcher.check_interval_seconds
 
     def _row_click(self, _event=None) -> None:
@@ -281,11 +283,18 @@ class AutoSyncGUI:
         top_bar = tk.Frame(self.root)
         top_bar.pack(fill="x", padx=6, pady=(6, 0))
         tk.Button(top_bar, text="+", width=3, command=self._open_add_dialog).pack(side="left")
+        # Пока нет отдельной иконки — просто текстовая кнопка "ПРОБЛЕМЫ (n)", хорошо видна и без
+        # значка. Нажатие — фильтр: показать только строки, где нужен ответ.
         self.alert_button = tk.Button(top_bar, text="", command=self._toggle_filter, fg="#a4000f")
         self.alert_button.pack(side="left", padx=8)
 
-        list_container = tk.Frame(self.root)
-        list_container.pack(fill="both", expand=True, padx=6, pady=6)
+        # Список репозиториев и лог — в PanedWindow, чтобы можно было перетащить границу между
+        # ними мышью и увеличить лог, если строк репозиториев мало, а лога нужно много видно
+        # (жалоба "только 5 строчек лога и не видно больше").
+        paned = ttk.PanedWindow(self.root, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
+
+        list_container = tk.Frame(paned)
         canvas = tk.Canvas(list_container, highlightthickness=0)
         scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
         self.rows_frame = tk.Frame(canvas)
@@ -298,9 +307,21 @@ class AutoSyncGUI:
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        paned.add(list_container, weight=3)
 
-        self.log_text = tk.Text(self.root, state="disabled", height=8, wrap="word")
-        self.log_text.pack(fill="x", padx=6, pady=(0, 6))
+        log_container = tk.Frame(paned)
+        log_bar = tk.Frame(log_container)
+        log_bar.pack(fill="x")
+        tk.Label(log_bar, text="Журнал событий").pack(side="left", padx=(2, 0))
+        tk.Button(log_bar, text="Копировать весь лог", command=self._copy_log).pack(side="right")
+        log_body = tk.Frame(log_container)
+        log_body.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_body, state="disabled", wrap="word")
+        log_scrollbar = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_scrollbar.pack(side="right", fill="y")
+        paned.add(log_container, weight=2)
 
         self.filter_mode = False
         self._rows: dict = {}
@@ -402,6 +423,13 @@ class AutoSyncGUI:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _copy_log(self) -> None:
+        # Выделение и Ctrl+C в самом Text и так работают даже при state="disabled" (запрещено
+        # только редактирование), но явная кнопка — надёжнее и заметнее, чем полагаться на то,
+        # что это очевидно.
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get("1.0", "end-1c"))
+
     def _add_row(self, watcher) -> None:
         row = RepoRow(self.rows_frame, watcher, self)
         self._rows[watcher.name] = row
@@ -424,31 +452,54 @@ class AutoSyncGUI:
     def _open_add_dialog(self) -> None:
         win = tk.Toplevel(self.root)
         win.title("Добавить репозиторий")
+
+        # Порядок и подписи — по вашему списку (папка хранения / ветка для push / интервал),
+        # плюс два необязательных поля с понятным объяснением, что это и зачем — заполнять их
+        # нужно не всегда:
+        #   "Имя" — просто подпись репозитория в списке и в файле состояния (state.json). Если
+        #       оставить пустым — возьмём имя папки автоматически, ничего вводить не обязательно.
+        #   "Папка слежения внутри репозитория" — НЕ путь к самому репозиторию (это отдельное
+        #       поле выше), а конкретная подпапка ВНУТРИ него, изменения в которой должны сразу
+        #       пушиться (например у вас — "Godot_Template_Life_Operator", а не весь проект
+        #       целиком, где много не относящихся к делу файлов). Если оставить пустым — будет
+        #       следить за всей папкой репозитория.
+        # Git-адрес (origin) отдельно не спрашиваем — берём как уже настроено в самой папке
+        # (git remote), спрашиваем только ветку, потому что именно её вы выбираете сами.
         fields = {}
-        labels = ["Имя", "Путь к репозиторию (папка с .git)", "Ветка", "Путь слежения (относительно репозитория)",
-                  "Интервал проверки, мин"]
-        keys = ["name", "path", "branch", "watch_path", "interval"]
-        for i, (label, key) in enumerate(zip(labels, keys)):
-            tk.Label(win, text=label).grid(row=i, column=0, sticky="w", padx=8, pady=4)
-            entry = tk.Entry(win, width=48)
+        rows = [
+            ("path", "Папка хранения (где лежит .git)", True),
+            ("branch", "Ветка для push", True),
+            ("interval", "Через сколько секунд проверять git", True),
+            ("name", "Имя (необязательно — по умолчанию из папки)", False),
+            ("watch_path", "Папка слежения внутри репозитория (необязательно — по умолчанию вся папка)", False),
+        ]
+        for i, (key, label, _required) in enumerate(rows):
+            tk.Label(win, text=label, wraplength=260, justify="left").grid(
+                row=i, column=0, sticky="w", padx=8, pady=4
+            )
+            entry = tk.Entry(win, width=40)
             entry.grid(row=i, column=1, padx=8, pady=4)
             fields[key] = entry
-        fields["interval"].insert(0, "30")
+        fields["interval"].insert(0, "1800")
 
         def submit():
+            path = fields["path"].get().strip()
+            branch = fields["branch"].get().strip()
+            if not (path and branch):
+                return
+            name = fields["name"].get().strip() or Path(path).name
+            watch_path = fields["watch_path"].get().strip()  # пусто — следим за всей папкой репозитория
             repo_cfg = {
-                "name": fields["name"].get().strip(),
-                "path": fields["path"].get().strip(),
-                "branch": fields["branch"].get().strip(),
-                "watch_paths": [fields["watch_path"].get().strip()],
+                "name": name,
+                "path": path,
+                "branch": branch,
+                "watch_paths": [watch_path],
             }
             try:
-                interval_minutes = int(fields["interval"].get().strip() or "30")
+                interval_seconds = int(fields["interval"].get().strip() or "1800")
             except ValueError:
-                interval_minutes = 30
-            if not (repo_cfg["name"] and repo_cfg["path"] and repo_cfg["branch"] and repo_cfg["watch_paths"][0]):
-                return
-            watcher = self._on_add_repo_cb(repo_cfg, interval_minutes)
+                interval_seconds = 1800
+            watcher = self._on_add_repo_cb(repo_cfg, interval_seconds)
             self.watchers.append(watcher)
             self._add_row(watcher)
             win.destroy()
@@ -463,7 +514,7 @@ class AutoSyncGUI:
 
     def _tick(self) -> None:
         pending_count = sum(1 for w in self.watchers if w.pending_question is not None)
-        self.alert_button.configure(text=f"! {pending_count}" if pending_count else "")
+        self.alert_button.configure(text=f"ПРОБЛЕМЫ ({pending_count})" if pending_count else "")
         if self.filter_mode and pending_count == 0:
             self.filter_mode = False
         self._apply_filter()

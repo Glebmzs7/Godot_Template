@@ -86,16 +86,16 @@ def _save_config() -> None:
 
 
 class RepoWatcher(FileSystemEventHandler):
-    def __init__(self, repo_cfg: dict, dev_id: int, check_interval_minutes: int):
+    def __init__(self, repo_cfg: dict, dev_id: int, check_interval_seconds: int):
         self.repo_path = Path(repo_cfg["path"])
         self.branch = repo_cfg["branch"]
         self.name = repo_cfg["name"]
-        self.watch_paths = list(repo_cfg["watch_paths"])
+        self.watch_paths = list(repo_cfg["watch_paths"]) or [""]
         self.dev_id = dev_id
         self._lock = threading.Lock()
         self._observed_watches: list = []  # для пере-регистрации слежения при смене пути
 
-        self.check_interval_seconds = check_interval_minutes * 60
+        self.check_interval_seconds = check_interval_seconds
         self.next_check_at = time.time() + self.check_interval_seconds
 
         # known_version — версия, которую мы сами приняли/подтвердили в прошлый раз (state.py).
@@ -338,13 +338,13 @@ def _unregister_watch(watcher: RepoWatcher) -> None:
     watcher._observed_watches.clear()
 
 
-def add_repo_runtime(repo_cfg: dict, interval_minutes: int):
+def add_repo_runtime(repo_cfg: dict, interval_seconds: int):
     """Вызывается из окна (кнопка '+'): создать репозиторий, сохранить в config.json, начать
     следить. Версию не спрашиваем — она сама подтянется с git при первой проверке."""
     cfg.setdefault("repos", []).append(repo_cfg)
     _save_config()
 
-    watcher = RepoWatcher(repo_cfg, cfg["dev_id"], interval_minutes)
+    watcher = RepoWatcher(repo_cfg, cfg["dev_id"], interval_seconds)
     _register_watch(watcher)
     log(watcher.name, "Репозиторий добавлен — первичная проверка...")
     threading.Thread(target=watcher.sverka_versiy, args=(REASON_START,), daemon=True).start()
@@ -405,7 +405,9 @@ def main(config_path_: str = "config.json") -> None:
     config_path = config_path_
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     dev_id = cfg["dev_id"]
-    default_interval = cfg["check_interval_minutes"]
+    # config.json по-прежнему хранит интервал в минутах (не переписываем формат файла) — окно и
+    # все интерактивные диалоги дальше работают в секундах, переводим только один раз здесь.
+    default_interval = cfg["check_interval_minutes"] * 60
 
     observer = Observer()
     watchers = [RepoWatcher(repo_cfg, dev_id, default_interval) for repo_cfg in cfg["repos"]]

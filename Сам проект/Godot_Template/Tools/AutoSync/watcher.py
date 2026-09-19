@@ -49,8 +49,8 @@ from watchdog.observers import Observer
 import git_ops
 import notifier
 import state
+import version
 from gui import AutoSyncGUI, remote_to_github_web_url
-from version import Version, parse
 
 REASON_START = "Запуск"
 REASON_PUSH = "Пуш"
@@ -86,16 +86,16 @@ def _save_config() -> None:
 
 
 class RepoWatcher(FileSystemEventHandler):
-    def __init__(self, repo_cfg: dict, dev_id: int, check_interval_minutes: int):
+    def __init__(self, repo_cfg: dict, dev_id: int, check_interval_seconds: int):
         self.repo_path = Path(repo_cfg["path"])
         self.branch = repo_cfg["branch"]
         self.name = repo_cfg["name"]
-        self.watch_paths = list(repo_cfg["watch_paths"])
+        self.watch_paths = list(repo_cfg["watch_paths"]) or [""]
         self.dev_id = dev_id
         self._lock = threading.Lock()
         self._observed_watches: list = []  # для пере-регистрации слежения при смене пути
 
-        self.check_interval_seconds = check_interval_minutes * 60
+        self.check_interval_seconds = check_interval_seconds
         self.next_check_at = time.time() + self.check_interval_seconds
 
         # known_version — версия, которую мы сами приняли/подтвердили в прошлый раз (state.py).
@@ -213,56 +213,30 @@ class RepoWatcher(FileSystemEventHandler):
         self.last_action = "обновлено с git"
         log(self.name, f"Результат: обновлено с git до {git_version}")
 
-    def _next_version(self) -> Version:
-        base = self.known_version or self.current_tag
-        if not base or base == "тегов ещё нет":
-            return Version(
-                stable=0, stable_patch=0, beta=0, beta_push=0,
-                dev_id=self.dev_id, task_label=0, push_count=0,
-            )
-        prev = parse(base)
-        return Version(
-            stable=prev.stable, stable_patch=prev.stable_patch,
-            beta=prev.beta, beta_push=prev.beta_push,
-            dev_id=self.dev_id, task_label=prev.task_label, push_count=prev.push_count + 1,
-            project_sync=prev.project_sync,
-        )
+    def manual_set_version(self, new_prefix: str) -> None:
+        """Ручное изменение версии — разработчик просто вписывает любой текст (никакого формата
+        не требуется, хоть 'HJDF3123Hj0'), push_count при этом обнуляется и дальше снова растёт
+        сам по +1 на каждый пуш.
 
-    def manual_set_version(self, new_version: Version) -> None:
-        """Ручное изменение версии (разработчик сам двигает Stable/Beta/task_label и т.п.) —
-        push_count при этом всегда обнуляется: это начало нового отрезка версий, дальше он снова
-        растёт автоматически по +1 на каждый пуш, как обычно.
-
-        Разрешено ТОЛЬКО когда нет расхождения с git (известная нам версия и то, что реально на
-        git, совпадают) — единственное, что должно меняться в этом действии, это обозначение
-        версии, а не заодно ещё и разрешение какого-то незакрытого расхождения. Если расхождение
-        есть — просим сначала разрешить его обычным путём (СВЕРКА_ВЕРСИЙ/ПРОЦЕСС_СЛИЯНИЯ_РАСХОЖДЕНИЙ),
-        а не протаскиваем его через ручное изменение версии."""
+        Это осознанно принудительное действие (force-with-lease) — сделано так, а не с отказом
+        при расхождении: если разработчик явно вписал версию и нажал "Применить", значит его
+        решение и есть новая истина, независимо от того, что раньше застряло на git (в том числе
+        если там повис старый некорректный тег, который иначе было не поправить из программы)."""
         with self._lock:
-            self.last_action = "проверяем расхождения перед ручным изменением версии..."
-            log(self.name, "Проверка перед ручным изменением версии...")
+            log(self.name, f"Ручное изменение версии на {new_prefix!r}...")
             try:
                 git_ops.fetch(self.repo_path)
-                git_version = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
             except git_ops.GitError as e:
                 self.last_action = "нет связи с git — версия не изменена"
                 log(self.name, f"Ручное изменение версии отменено: нет связи с git — {e}")
                 return
-
-            self.current_tag = git_version or "тегов ещё нет"
-            if git_version != self.known_version:
-                self.last_action = "есть расхождение с git — сначала разрешите его"
-                log(self.name, "Ручное изменение версии отменено: есть расхождение с git, "
-                                "сначала нужно его разрешить обычной проверкой")
-                return
-
-            new_version.push_count = 0
             self._action_push(
-                reason=f"Ручное обновление версии: {new_version.format()}",
-                explicit_version=new_version,
+                reason=f"Ручное обновление версии: {new_prefix}",
+                force=True,
+                explicit_prefix=new_prefix,
             )
 
-    def _action_push(self, reason: str, force: bool = False, explicit_version: Optional[Version] = None) -> None:
+    def _action_push(self, reason: str, force: bool = False, explicit_prefix: Optional[str] = None) -> None:
         self.last_action = "передаём синхронизацию..."
         log(self.name, "Передаём синхронизацию (commit + push)...")
 
@@ -279,19 +253,29 @@ class RepoWatcher(FileSystemEventHandler):
             log(self.name, f"Результат: ошибка при коммите/пуше — {e}")
             return
 
-        # При ручном изменении версии используем версию, которую задал разработчик, а не
-        # автоматически посчитанную следующую — но если её тег вдруг уже занят, всё равно не
-        # сдаёмся (см. цикл ниже), просто едем по push_count дальше от неё.
-        version = explicit_version if explicit_version is not None else self._next_version()
+        # Версия — это просто префикс (любой текст) + свой номер пуша (version.py). При ручном
+        # изменении префикс задан явно и push_count начинается с 0; иначе берём то, что уже
+        # знаем, и увеличиваем номер пуша на 1. Если конкретный тег вдруг уже занят на git — не
+        # сдаёмся (см. цикл ниже), просто едем по номеру пуша дальше.
+        if explicit_prefix is not None:
+            prefix, push_count = explicit_prefix, 0
+        else:
+            base = self.known_version or self.current_tag
+            if not base or base == "тегов ещё нет":
+                prefix, push_count = str(self.dev_id), 0
+            else:
+                prefix, prev_push = version.split_prefix_and_push(base)
+                push_count = prev_push + 1
+
         tag = None
         for _ in range(50):
-            tag = version.format()
+            candidate = version.build_tag(prefix, push_count)
             try:
-                git_ops.create_and_push_tag(self.repo_path, tag, message=reason)
+                git_ops.create_and_push_tag(self.repo_path, candidate, message=reason)
+                tag = candidate
                 break
             except git_ops.GitError:
-                version.push_count += 1
-                tag = None
+                push_count += 1
         if tag is None:
             self.last_check_time = _now_str()
             self.last_action = "пуш прошёл, тег не поставлен"
@@ -354,43 +338,67 @@ def _unregister_watch(watcher: RepoWatcher) -> None:
     watcher._observed_watches.clear()
 
 
-def add_repo_runtime(repo_cfg: dict, interval_minutes: int):
+def add_repo_runtime(repo_cfg: dict, interval_seconds: int):
     """Вызывается из окна (кнопка '+'): создать репозиторий, сохранить в config.json, начать
     следить. Версию не спрашиваем — она сама подтянется с git при первой проверке."""
     cfg.setdefault("repos", []).append(repo_cfg)
     _save_config()
 
-    watcher = RepoWatcher(repo_cfg, cfg["dev_id"], interval_minutes)
+    watcher = RepoWatcher(repo_cfg, cfg["dev_id"], interval_seconds)
     _register_watch(watcher)
     log(watcher.name, "Репозиторий добавлен — первичная проверка...")
     threading.Thread(target=watcher.sverka_versiy, args=(REASON_START,), daemon=True).start()
     return watcher
 
 
-def edit_repo_runtime(watcher: RepoWatcher, branch: Optional[str] = None,
-                       watch_path: Optional[str] = None) -> None:
-    """Вызывается из окна (пункты 'Изменить...' в контекстных меню)."""
+def edit_repo_runtime(watcher: RepoWatcher, name: Optional[str] = None, path: Optional[str] = None,
+                       branch: Optional[str] = None, watch_path: Optional[str] = None,
+                       interval_seconds: Optional[int] = None) -> None:
+    """Вызывается из окна (отдельные пункты 'Изменить...' в контекстных меню, и полное окно
+    'Изменить репозиторий...' по правому клику на строке — оно может прислать сразу все поля)."""
+    old_name = watcher.name
     for repo_cfg in cfg.get("repos", []):
-        if repo_cfg["name"] != watcher.name:
+        if repo_cfg["name"] != old_name:
             continue
+
+        needs_rewatch = bool(path) or (watch_path is not None)
+        if needs_rewatch:
+            _unregister_watch(watcher)
+
+        if name and name != old_name:
+            watcher.name = name
+            repo_cfg["name"] = name
+            # известная версия хранится в state.json по имени — переносим на новое, чтобы
+            # переименование не выглядело как "версия сбросилась"
+            known = state.load_known_version(old_name)
+            if known is not None:
+                state.save_known_version(name, known)
+        if path:
+            watcher.repo_path = Path(path)
+            repo_cfg["path"] = path
+            watcher._remote_url_cache = None
         if branch:
             watcher.branch = branch
             repo_cfg["branch"] = branch
             watcher._remote_url_cache = None
-        if watch_path:
-            _unregister_watch(watcher)
+        if watch_path is not None:  # пустая строка — осознанный выбор "следить за всей папкой"
             watcher.watch_paths = [watch_path]
             repo_cfg["watch_paths"] = [watch_path]
+        if interval_seconds:
+            watcher.check_interval_seconds = interval_seconds
+            watcher.next_check_at = time.time() + interval_seconds
+
+        if needs_rewatch:
             _register_watch(watcher)
         break
     _save_config()
     log(watcher.name, "Настройки репозитория изменены")
 
 
-def manual_version_change_runtime(watcher: RepoWatcher, new_version: Version) -> None:
+def manual_version_change_runtime(watcher: RepoWatcher, new_prefix: str) -> None:
     """Вызывается из окна ('Изменить версию...') — сама git-операция идёт в фоновом потоке,
     чтобы не подвешивать окно на время commit+push."""
-    threading.Thread(target=watcher.manual_set_version, args=(new_version,), daemon=True).start()
+    threading.Thread(target=watcher.manual_set_version, args=(new_prefix,), daemon=True).start()
 
 
 def periodic_check_loop(watchers: list) -> None:
@@ -421,7 +429,9 @@ def main(config_path_: str = "config.json") -> None:
     config_path = config_path_
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     dev_id = cfg["dev_id"]
-    default_interval = cfg["check_interval_minutes"]
+    # config.json по-прежнему хранит интервал в минутах (не переписываем формат файла) — окно и
+    # все интерактивные диалоги дальше работают в секундах, переводим только один раз здесь.
+    default_interval = cfg["check_interval_minutes"] * 60
 
     observer = Observer()
     watchers = [RepoWatcher(repo_cfg, dev_id, default_interval) for repo_cfg in cfg["repos"]]
