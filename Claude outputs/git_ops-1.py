@@ -39,6 +39,15 @@ def current_branch(repo_path: Path) -> str:
     return _run(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
 
 
+def remote_url(repo_path: Path, remote: str = "origin") -> Optional[str]:
+    """Для ссылки на git в окне (пункт 2 списка строки) — берём как есть, что настроено у git,
+    без своих догадок."""
+    try:
+        return _run(repo_path, "remote", "get-url", remote)
+    except GitError:
+        return None
+
+
 @dataclass
 class AheadBehind:
     ahead: int   # локальных коммитов, которых нет в remote
