@@ -1,38 +1,70 @@
 """
 AutoSync — основной процесс демона.
 
-Логика на файл-событие (п.5 списка действий, БЕЗ debounce — так решили: сохранил → сразу пуш):
-    1. Есть материал для пуша (сработало файловое событие, отфильтрованное от мусора).
-    2. Обращаемся к серверу (git fetch) + сверка git vs local (ahead/behind) — п.3 из уточнения:
-       «перед этим проверка на совпадения git и local».
-    3. Если behind > 0 (в remote есть то, чего нет локально) — это расхождение, не пушим
-       вслепую, идём в notifier.ask_sync_choice (вопрос пользователю, п.3 списка действий).
-    4. Если расхождений нет — передаём синхронизацию (commit+push), ставим тег версии, печатаем
-       результат.
+Вся логика собрана вокруг ОДНОЙ функции — СВЕРКА_ВЕРСИЙ (в коде: RepoWatcher.sverka_versiy) —
+её вызывает и живое сохранение файла, и периодическая проверка, и старт программы. Разница
+только в параметре "причина": "Пуш" (файл только что живьём сохранён — пушим сразу, без
+вопросов) или "Запуск" (обычный повод — старт/таймер/возврат из другого действия — если тут
+находятся незарегистрированные изменения, сначала спрашиваем пользователя).
 
-Периодическая проверка (п.6) — тот же путь, но без события сохранения — просто по таймеру.
-При старте программы делается одна такая же проверка сразу (чтобы статус-борд с первого кадра
-показывал реальное состояние, а не заглушки).
+СВЕРКА_ВЕРСИЙ:
+    1. Смотрим версию, которую мы сами в прошлый раз подтвердили (known_version, state.py).
+    2. git fetch. Не получилось — ДЕЙСТВИЕ_ОШИБКА_СВЯЗИ.
+    3. Смотрим, какая версия сейчас реально на git (current_tag — для строки статуса; None,
+       если тегов ещё нет).
+    4. Сравниваем known_version с git-версией:
+       - Совпало (в т.ч. когда обеих нет вообще):
+           - есть локальные изменения:
+               - причина "Пуш" -> ДЕЙСТВИЕ_ПУШ сразу
+               - причина "Запуск" -> ДЕЙСТВИЯ_ОЖИДАНИЯ_РЕШЕНИЯ_ПО_ПРЕДЛОЖЕНИЮ -> (да) ДЕЙСТВИЕ_ПУШ
+           - нет изменений -> ДЕЙСТВИЕ_ПРОДОЛЖИТЬ_СЛЕЖЕНИЕ
+       - Не совпало:
+           - known_version, который мы помним, уже не существует как тег на git (пропуск/сбой,
+             локально мы "уехали вперёд" несуществующего) -> ПРОЦЕСС_СЛИЯНИЯ_РАСХОЖДЕНИЙ
+           - иначе (git реально ушёл вперёд по сравнению с тем, что мы знали):
+               - нет локальных изменений -> ДЕЙСТВИЯ_ОЖИДАНИЯ_РЕШЕНИЯ_ПО_ПРЕДЛОЖЕНИЮ ->
+                 (да) ДЕЙСТВИЕ_ОБНОВИТЬ_ЛОКАЛЬНО
+               - есть локальные изменения -> ПРОЦЕСС_СЛИЯНИЯ_РАСХОЖДЕНИЙ
 
-В консоль постоянно выводится живой статус ОДНОЙ строкой (обновляется на месте через `\r`,
-без многострочных ANSI-кодов — они ненадёжно работают в разных консолях Windows). Перед тем,
-как что-то важное печатается в прокрутку (лог с деталями синхронизации), эта строка сначала
-стирается пробелами, а на следующем тике рисуется заново — так лог и статус не наслаиваются.
+ДЕЙСТВИЯ_ОЖИДАНИЯ_РЕШЕНИЯ_ПО_ПРЕДЛОЖЕНИЮ — блокирующий вопрос (notifier.ask_yes_no): программа
+именно ЖДЁТ ответа по этому репозиторию, а не откладывает до следующего повода. Отказ — просто
+ничего не делаем в этот раз (следующий повод — файл/таймер — запустит проверку заново).
+
+ДЕЙСТВИЕ_ПУШ включает в себя и саму отправку, и проверку результата одним действием: коммит +
+пуш + тег -> заново спрашиваем git, что там теперь -> если совпало с ожидаемым и рабочее дерево
+чистое — принимаем новую версию как известную и запускаем СВЕРКА_ВЕРСИЙ("Запуск") заново с чистого
+листа; если не совпало — что-то пошло не так и это уже ПРОЦЕСС_СЛИЯНИЯ_РАСХОЖДЕНИЙ.
+
+ПРОЦЕСС_СЛИЯНИЯ_РАСХОЖДЕНИЙ — показываем разницу и спрашиваем пользователя (notifier.ask_sync_choice,
+готовый инструмент git, велосипед не изобретаем): оставить локальное (force-push + ДЕЙСТВИЕ_ПУШ),
+взять git (ровно то же самое, что ДЕЙСТВИЕ_ОБНОВИТЬ_ЛОКАЛЬНО — не дублируем логику) или открыть
+mergetool (после ручного слияния — СВЕРКА_ВЕРСИЙ("Запуск") заново).
+
+В консоль выводится живой статус СТОЛБИКОМ (по строке на репозиторий), обновляется на месте через
+ANSI-коды курсора. Весь консольный вывод (log/StatusBoard и вопросы пользователю в notifier.py)
+идёт через одну общую блокировку (console_lock.py), чтобы ничего не портило другое.
 """
 
 import fnmatch
 import json
+import os
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 import git_ops
 import notifier
-from version import Version, VALID_STATUSES, parse
+import state
+from console_lock import LOCK as _console_lock
+from version import Version, parse
+
+REASON_START = "Запуск"
+REASON_PUSH = "Пуш"
 
 # Служебные/временные файлы, которые НЕ должны триггерить коммит.
 # Пример из практики: Yandex Disk пишет файлы атомарно — сначала во временный
@@ -45,8 +77,15 @@ IGNORE_PATTERNS = [
     "*.godot.import",
 ]
 
-_console_lock = threading.Lock()  # чтобы строки из разных потоков не перемешивались посимвольно
-_status_line_len = [0]            # длина текущей однострочной сводки на экране (для очистки/паддинга)
+_activity_version = [0]  # счётчик: любой log() увеличивает — StatusBoard видит "было новое"
+
+
+def _enable_ansi_on_windows() -> None:
+    """cmd.exe на Windows 10+ понимает ANSI-коды курсора, но их обработку нужно один раз
+    включить — простой и широко известный трюк: пустой os.system("") инициализирует консоль
+    в режиме, где VT100-последовательности начинают работать."""
+    if os.name == "nt":
+        os.system("")
 
 
 def _is_ignored(filename: str) -> bool:
@@ -59,11 +98,8 @@ def _now_str() -> str:
 
 def log(repo_name: str, message: str) -> None:
     with _console_lock:
-        if _status_line_len[0]:
-            # стереть текущую однострочную сводку, прежде чем печатать обычную строку лога
-            print("\r" + " " * _status_line_len[0] + "\r", end="")
-            _status_line_len[0] = 0
         print(f"[{_now_str()}] [{repo_name}] {message}")
+        _activity_version[0] += 1
 
 
 class RepoWatcher(FileSystemEventHandler):
@@ -74,22 +110,21 @@ class RepoWatcher(FileSystemEventHandler):
         self.dev_id = dev_id
         self._lock = threading.Lock()
 
-        # Состояние для строки статуса (StatusBoard читает эти поля). Обновляется на КАЖДОЙ
-        # проверке (а не только когда реально что-то запушили) — п. задачи "добавить данные о
-        # первичной проверке синхронизации вместо заглушек".
+        # known_version — версия, которую мы сами приняли/подтвердили в прошлый раз (state.py).
+        # current_tag — что реально сейчас стоит на git, только для отображения в столбике.
+        self.known_version: Optional[str] = state.load_known_version(self.name)
+        self.current_tag: str = self.known_version or "тегов ещё нет"
+
         self.last_check_time: str = "ещё не было"
-        self.last_mode: str = "—"
-        self.current_tag: str = "—"
-        self.last_action: str = "—"
+        self.last_action: str = "ожидание"
 
-    def one_line_status(self) -> str:
-        return f"{self.name}: {self.current_tag} ({self.last_action}, {self.last_check_time})"
+    def status_line(self) -> str:
+        return f"{self.name}: {self.current_tag} — {self.last_action} ({self.last_check_time})"
 
-    def _refresh_known_tag(self) -> None:
-        """Подтягивает актуальный тег ветки из git — вызывается на каждой проверке, независимо
-        от того, пушили мы что-то в этот раз или нет, чтобы борд не показывал заглушки."""
-        latest = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
-        self.current_tag = latest or "тегов ещё нет"
+    def _accept_version(self, tag: str) -> None:
+        self.known_version = tag
+        state.save_known_version(self.name, tag)
+        self.current_tag = tag
 
     # --- события файловой системы ------------------------------------------------
 
@@ -100,123 +135,207 @@ class RepoWatcher(FileSystemEventHandler):
         if _is_ignored(filename):
             return
         log(self.name, f"Есть материал для пуша: {event.src_path}")
-        self._sync(reason=f"изменён файл: {event.src_path}", mode="Автоматически")
+        self.sverka_versiy(REASON_PUSH)
 
-    # --- основная логика -----------------------------------------------------------
+    # --- СВЕРКА_ВЕРСИЙ и действия ---------------------------------------------------
 
-    def _sync(self, reason: str, mode: str) -> None:
+    def sverka_versiy(self, reason: str) -> None:
         with self._lock:  # чтобы два быстрых сохранения подряд не гонялись за git одновременно
-            self.last_check_time = _now_str()
-            self.last_mode = mode
-
+            self.last_action = "обращаемся к серверу..."
             log(self.name, "Обращаемся к серверу (git fetch)...")
+
             try:
                 git_ops.fetch(self.repo_path)
-                state = git_ops.ahead_behind(self.repo_path, self.branch)
+                git_version = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
             except git_ops.GitError as e:
-                self.last_action = "ошибка проверки"
-                log(self.name, f"Результат: ошибка git при проверке — {e}")
-                notifier.notify(f"AutoSync [{self.name}]", f"Ошибка git при проверке: {e}")
+                self._action_error_connection(reason, e)
                 return
 
-            self._refresh_known_tag()
+            self.current_tag = git_version or "тегов ещё нет"
 
-            if state.behind > 0:
-                # Расхождение: в git есть то, чего нет локально — это п.3, вопрос пользователю,
-                # НЕ пушим вслепую поверх.
-                diff = git_ops.diff_name_status(
-                    self.repo_path, self.branch, f"origin/{self.branch}"
-                )
-                self.last_action = f"расхождение ({state.behind} позади)"
-                log(self.name, f"Результат: расхождение с git ({state.behind} коммитов позади) — нужен выбор")
-                notifier.notify(
-                    f"AutoSync [{self.name}]",
-                    f"Расхождение с git на ветке {self.branch} ({state.behind} коммитов позади) — нужен выбор",
-                )
-                choice = notifier.ask_sync_choice(self.branch, diff)
-                self._resolve(choice)
+            if git_version == self.known_version:
+                self._branch_matched(reason)
                 return
 
-            if not git_ops.has_local_changes(self.repo_path):
-                self.last_action = "актуально, изменений нет"
-                log(self.name, "Результат: локальных изменений не найдено, пуш не нужен")
+            # Версии не совпали. Если то, что мы сами помним, уже не существует как тег на
+            # git — это не "git ушёл вперёд", а разрыв/сбой (или локально "уехали" без пуша) —
+            # сразу в процесс слияния, сравнивать тут больше нечего.
+            if self.known_version is not None and not git_ops.tag_exists(self.repo_path, self.known_version):
+                log(self.name, "Известная нам версия не найдена на git — расхождение, нужен выбор")
+                self._process_slияniya_raskhozhdeniy(reason)
                 return
 
-            log(self.name, "Передаём синхронизацию (commit + push)...")
-            self._commit_and_push(reason, mode)
+            # Иначе — git реально ушёл вперёд по сравнению с тем, что мы знали.
+            self._branch_git_ahead(reason, git_version)
 
-    def _resolve(self, choice: notifier.SyncChoice) -> None:
-        if choice == notifier.SyncChoice.TAKE_GIT:
-            git_ops._run(self.repo_path, "reset", "--hard", f"origin/{self.branch}")
-        elif choice == notifier.SyncChoice.TAKE_LOCAL:
-            git_ops._run(self.repo_path, "push", "--force-with-lease", "origin", self.branch)
+    def _branch_matched(self, reason: str) -> None:
+        if not git_ops.has_local_changes(self.repo_path):
+            self.last_check_time = _now_str()
+            self.last_action = "актуально, изменений нет"
+            log(self.name, "Результат: локальных изменений не найдено, пуш не нужен")
+            return  # ДЕЙСТВИЕ_ПРОДОЛЖИТЬ_СЛЕЖЕНИЕ — просто ждём следующего файлового события
+
+        if reason == REASON_PUSH:
+            self._action_push(reason)
+            return
+
+        # reason == REASON_START: расхождение, которое мы сами только что не создавали (не
+        # живое сохранение) — сначала спрашиваем пользователя.
+        self.last_action = "есть незафиксированные изменения — нужен ответ"
+        log(self.name, "Найдены незафиксированные локальные изменения")
+        if notifier.ask_yes_no(f"[{self.name}] Есть незафиксированные изменения. Запушить их?"):
+            self._action_push(reason)
         else:
-            git_ops.open_mergetool(self.repo_path)
+            self.last_check_time = _now_str()
+            self.last_action = "изменения найдены, пуш отложен пользователем"
+            log(self.name, "Пользователь отложил пуш")
+
+    def _branch_git_ahead(self, reason: str, git_version: Optional[str]) -> None:
+        if not git_ops.has_local_changes(self.repo_path):
+            self.last_action = "на git есть более новая версия — нужен ответ"
+            log(self.name, f"На git версия {git_version}, у нас {self.known_version} — нужен ответ")
+            if notifier.ask_yes_no(f"[{self.name}] На git есть более новая версия {git_version}. Обновить локально?"):
+                self._action_update_local(git_version)
+            else:
+                self.last_check_time = _now_str()
+                self.last_action = "есть новая версия на git, обновление отложено"
+                log(self.name, "Пользователь отложил обновление")
+        else:
+            log(self.name, "На git есть новая версия, и локально тоже есть изменения — нужен выбор")
+            self._process_slияniya_raskhozhdeniy(reason)
+
+    def _action_error_connection(self, reason: str, error: Exception) -> None:
+        self.last_check_time = _now_str()
+        self.last_action = "нет связи с git"
+        log(self.name, f"Результат: нет связи с git — {error}")
+        if notifier.ask_yes_no(f"[{self.name}] Нет связи с git. Повторить попытку?"):
+            self.sverka_versiy(reason)
+        # иначе просто ничего не делаем сейчас — следующий повод (файл/таймер) проверит заново
+
+    def _action_update_local(self, git_version: str) -> None:
+        git_ops.reset_hard(self.repo_path, f"origin/{self.branch}")
+        self._accept_version(git_version)
+        self.last_check_time = _now_str()
+        self.last_action = "обновлено с git"
+        log(self.name, f"Результат: обновлено с git до {git_version}")
 
     def _next_version(self) -> Version:
-        """push_count растёт автоматически на +1 от последнего тега ветки (решение пользователя:
-        "версии с альфа пушатся автоматически просто по порядку 0,1,2 и т.д."). Stable/Beta и
-        task_label демон САМ не меняет — их вручную двигает разработчик, когда решает
-        зафиксировать более старшую версию или подать заявку на слияние в Beta/Stable."""
-        latest = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
-        if latest is None:
+        """push_count растёт автоматически на +1 от последней известной версии (решение
+        пользователя: "версии с альфа пушатся автоматически просто по порядку 0,1,2 и т.д.").
+        Stable/Beta и task_label демон САМ не меняет — их вручную двигает разработчик."""
+        base = self.known_version or self.current_tag
+        if not base or base == "тегов ещё нет":
             return Version(
                 stable=0, stable_patch=0, beta=0, beta_push=0,
-                dev_id=self.dev_id, task_label=0, push_count=0, status="G",
+                dev_id=self.dev_id, task_label=0, push_count=0,
             )
-        prev = parse(latest)
+        prev = parse(base)
         return Version(
             stable=prev.stable, stable_patch=prev.stable_patch,
             beta=prev.beta, beta_push=prev.beta_push,
             dev_id=self.dev_id, task_label=prev.task_label, push_count=prev.push_count + 1,
-            status="G", project_sync=prev.project_sync,
+            project_sync=prev.project_sync,
         )
 
-    def _commit_and_push(self, reason: str, mode: str) -> None:
+    def _action_push(self, reason: str, force: bool = False) -> None:
+        self.last_action = "передаём синхронизацию..."
+        log(self.name, "Передаём синхронизацию (commit + push)...")
+
         try:
-            git_ops.add_commit(self.repo_path, ["."], message=reason)
-            git_ops.push(self.repo_path, self.branch)
+            if git_ops.has_local_changes(self.repo_path):
+                git_ops.add_commit(self.repo_path, ["."], message=reason)
+            if force:
+                git_ops.push_force_with_lease(self.repo_path, self.branch)
+            else:
+                git_ops.push(self.repo_path, self.branch)
         except git_ops.GitError as e:
+            self.last_check_time = _now_str()
             self.last_action = "ошибка коммита/пуша"
             log(self.name, f"Результат: ошибка при коммите/пуше — {e}")
             notifier.notify(f"AutoSync [{self.name}]", f"Ошибка при коммите/пуше: {e}")
             return
 
         # Коммит и пуш уже прошли успешно к этому моменту — дальше только тег. Если имя тега
-        # почему-то занято (latest_tag_on_branch не увидел уже существующий тег — например,
-        # git ещё не успел обновить локальные refs, или тег был создан отдельно), не сдаёмся
-        # сразу с ошибкой (тогда правки уедут в git БЕЗ версии) — пробуем следующий push_count,
-        # пока не найдём свободный.
+        # почему-то занято, не сдаёмся сразу (правки бы уехали в git БЕЗ версии) — пробуем
+        # следующий push_count, пока не найдём свободный.
         version = self._next_version()
+        tag = None
         for _ in range(50):
             tag = version.format()
             try:
                 git_ops.create_and_push_tag(self.repo_path, tag, message=reason)
-                self.current_tag = tag
-                self.last_action = "синхронизировано"
-                log(self.name, f"Результат: синхронизировано, {tag}")
-                notifier.notify(f"AutoSync [{self.name}]", f"Синхронизировано: {reason} ({tag})")
-                return
+                break
             except git_ops.GitError:
                 version.push_count += 1
-        self.last_action = "пуш прошёл, тег не поставлен"
-        log(self.name, f"Результат: код запушен, но свободный тег не найден за 50 попыток (последний: {tag})")
-        notifier.notify(
-            f"AutoSync [{self.name}]",
-            f"Код запушен, но не удалось подобрать свободный тег версии за 50 попыток "
-            f"(последний: {tag}) — коммит в {self.branch} есть, версия не проставлена",
-        )
+                tag = None
+        if tag is None:
+            self.last_check_time = _now_str()
+            self.last_action = "пуш прошёл, тег не поставлен"
+            log(self.name, "Результат: код запушен, но свободный тег не найден за 50 попыток")
+            notifier.notify(
+                f"AutoSync [{self.name}]",
+                "Код запушен, но не удалось подобрать свободный тег версии за 50 попыток",
+            )
+            return
+
+        # ДЕЙСТВИЕ_ПУШ включает проверку результата: заново спрашиваем git и сверяем, что
+        # появилось именно то, что мы ждём, и рабочее дерево чистое.
+        try:
+            git_ops.fetch(self.repo_path)
+            confirmed = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
+        except git_ops.GitError as e:
+            self.last_action = "ошибка проверки после пуша"
+            log(self.name, f"Результат: пуш прошёл, но проверка после пуша не удалась — {e}")
+            return
+
+        if confirmed == tag and not git_ops.has_local_changes(self.repo_path):
+            self._accept_version(tag)
+            self.last_check_time = _now_str()
+            self.last_action = "синхронизировано"
+            log(self.name, f"Результат: синхронизировано, {tag}")
+            notifier.notify(f"AutoSync [{self.name}]", f"Синхронизировано: {reason} ({tag})")
+            # Перезапускаем цикл с чистого листа — по сути "программа как будто только что
+            # заново проверила состояние".
+            self.sverka_versiy(REASON_START)
+        else:
+            log(self.name, "После пуша версия/файлы не совпали с ожиданием — уходим в слияние")
+            self._process_slияniya_raskhozhdeniy(reason)
+
+    def _process_slияniya_raskhozhdeniy(self, reason: str) -> None:
+        self.last_action = "расхождение — нужен выбор"
+        diff = git_ops.diff_name_status(self.repo_path, self.branch, f"origin/{self.branch}")
+        choice = notifier.ask_sync_choice(self.branch, diff)
+
+        if choice == notifier.SyncChoice.TAKE_LOCAL:
+            log(self.name, "Выбор пользователя: оставить локальную версию (force-push)")
+            self._action_push(reason, force=True)
+            return  # _action_push сам решит, что делать дальше (или перезапустит цикл)
+        elif choice == notifier.SyncChoice.TAKE_GIT:
+            log(self.name, "Выбор пользователя: взять версию с git")
+            git_version = git_ops.latest_tag_on_branch(self.repo_path, self.branch)
+            if git_version:
+                self._action_update_local(git_version)
+        else:
+            log(self.name, "Выбор пользователя: открыть mergetool")
+            git_ops.open_mergetool(self.repo_path)
+            log(self.name, "Mergetool закрыт — перепроверяем состояние")
+
+        self.sverka_versiy(REASON_START)
 
 
 class StatusBoard:
-    """Живая ОДНА строка в консоли: сводка по всем репозиториям + обратный отсчёт до плановой
-    проверки, обновляется на месте через `\\r` (возврат каретки) — работает в любом терминале
-    Windows, в отличие от многострочных ANSI-кодов курсора (не давших стабильный результат)."""
+    """Живой столбик в консоли: по строке на репозиторий + обратный отсчёт до плановой
+    проверки. Перерисовывается НА МЕСТЕ поверх своего предыдущего кадра (ANSI cursor-up +
+    очистка строки), пока между кадрами не было ничего интересного (см. _activity_version).
+    Как только где-то вызвался log() — на следующем кадре борд просто печатается заново ниже
+    этой записи, не пытаясь откатывать курсор через чужую строку."""
 
     def __init__(self, watchers: list[RepoWatcher], interval_minutes: int):
         self.watchers = watchers
         self.interval_seconds = interval_minutes * 60
         self.next_check_at = time.time() + self.interval_seconds
+        self._printed_lines = 0
+        self._last_seen_activity = _activity_version[0]
 
     def mark_checked_now(self) -> None:
         self.next_check_at = time.time() + self.interval_seconds
@@ -224,14 +343,18 @@ class StatusBoard:
     def _render_once(self) -> None:
         remaining = max(0, int(self.next_check_at - time.time()))
         mm, ss = divmod(remaining, 60)
-        parts = [w.one_line_status() for w in self.watchers]
-        parts.append(f"до проверки: {mm:02d}:{ss:02d}")
-        line = " | ".join(parts)
+        lines = [w.status_line() for w in self.watchers]
+        lines.append(f"До проверки на GitHub: {mm:02d}:{ss:02d}")
 
         with _console_lock:
-            pad = max(0, _status_line_len[0] - len(line))
-            print("\r" + line + " " * pad, end="", flush=True)
-            _status_line_len[0] = len(line)
+            current_activity = _activity_version[0]
+            redraw_in_place = self._printed_lines > 0 and current_activity == self._last_seen_activity
+            if redraw_in_place:
+                print(f"\033[{self._printed_lines}A", end="")  # курсор вверх на кол-во строк борда
+            for line in lines:
+                print("\033[2K" + line)  # очистить всю строку, затем напечатать новую
+            self._printed_lines = len(lines)
+            self._last_seen_activity = current_activity
 
     def loop(self) -> None:
         while True:
@@ -245,10 +368,11 @@ def periodic_check(watchers: list[RepoWatcher], board: StatusBoard) -> None:
         board.mark_checked_now()
         for w in watchers:
             log(w.name, "Плановая (периодическая) проверка...")
-            w._sync(reason="периодическая проверка", mode="Периодическая проверка")
+            w.sverka_versiy(REASON_START)
 
 
 def main(config_path: str = "config.json") -> None:
+    _enable_ansi_on_windows()
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     dev_id = cfg["dev_id"]
 
@@ -266,11 +390,11 @@ def main(config_path: str = "config.json") -> None:
 
     print("AutoSync запущен. Ctrl+C для остановки.")
 
-    # Первичная проверка сразу при старте — чтобы борд с первого кадра показывал реальные
+    # Первичная проверка сразу при старте — чтобы столбик с первого кадра показывал реальные
     # данные из git, а не заглушки "ещё не было".
     for w in watchers:
         log(w.name, "Первичная проверка синхронизации с GitHub...")
-        w._sync(reason="первичная проверка при запуске", mode="Первичная проверка")
+        w.sverka_versiy(REASON_START)
 
     board = StatusBoard(watchers, cfg["check_interval_minutes"])
     threading.Thread(target=periodic_check, args=(watchers, board), daemon=True).start()
