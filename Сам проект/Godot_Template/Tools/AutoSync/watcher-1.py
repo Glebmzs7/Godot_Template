@@ -48,6 +48,7 @@ from watchdog.observers import Observer
 
 import git_ops
 import notifier
+import self_update
 import state
 import version
 from gui import AutoSyncGUI, remote_to_github_web_url
@@ -62,6 +63,15 @@ IGNORE_PATTERNS = [
     "~$*",       # временные файлы Office и похожих программ
     "*.godot.import",
 ]
+
+# Папка самой программы AutoSync (там, где лежит этот watcher.py). Если она физически оказалась
+# ВНУТРИ отслеживаемого пути (как сейчас — Tools/AutoSync лежит внутри "Сам проект\Godot_Template",
+# которую и стережём) — свои же служебные файлы (autosync.log, state.json, __pycache__/*.pyc,
+# autosync_crash.log) были бы триггером собственного пуша программы саму на себя: лог пишется на
+# КАЖДОЕ сообщение, из-за чего запись в лог сама вызывала новую проверку/пуш, которая снова что-то
+# логировала, и т.д. — отсюда и подозрительные версии/теги. Файлы самой программы из слежения
+# полностью исключаем, независимо от имени.
+_AUTOSYNC_DIR = Path(__file__).resolve().parent
 
 app: Optional[AutoSyncGUI] = None       # выставляется в main() — единственный экземпляр окна
 observer: Optional[Observer] = None     # общий на всю программу — нужен для до/пере-регистрации слежения
@@ -140,7 +150,15 @@ class RepoWatcher(FileSystemEventHandler):
             return  # на всякий случай — по идее watch уже снят, событие сюда не должно прийти
         if event.is_directory:
             return
-        filename = Path(event.src_path).name
+
+        src_path = Path(event.src_path)
+        try:
+            src_path.resolve().relative_to(_AUTOSYNC_DIR)
+            return  # это собственный служебный файл AutoSync (лог/состояние/кэш) — не код проекта
+        except ValueError:
+            pass  # путь не внутри папки AutoSync — обычное событие, обрабатываем как раньше
+
+        filename = src_path.name
         if _is_ignored(filename):
             return
         log(self.name, f"Есть материал для пуша: {event.src_path}")
@@ -488,6 +506,32 @@ def _background_start(watchers: list) -> None:
     threading.Thread(target=periodic_check_loop, args=(watchers,), daemon=True).start()
 
 
+def _run_self_update_check() -> None:
+    """Простые самостоятельные диалоги для ЗАПУСК_САМОЙ_ПРОГРАММЫ — отдельный tk.Tk() на время
+    вопроса/сообщения (основное окно AutoSyncGUI ещё не создано на этом шаге)."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    def ask_yes_no(message: str) -> bool:
+        root = tk.Tk()
+        root.withdraw()
+        result = messagebox.askyesno("AutoSync — обновление", message)
+        root.destroy()
+        return result
+
+    def notify_and_exit(message: str) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("AutoSync — обновление", message)
+        root.destroy()
+
+    def log_to_stderr(message: str) -> None:
+        # На этом шаге лог из окна (app.log) ещё недоступен — окно ещё не создано.
+        print(message)
+
+    self_update.check_and_apply(ask_yes_no, notify_and_exit, log_to_stderr)
+
+
 def main(config_path_: Optional[str] = None) -> None:
     global app, observer, cfg, config_path
     if config_path_ is None:
@@ -503,6 +547,11 @@ def main(config_path_: Optional[str] = None) -> None:
     # config.json по-прежнему хранит интервал в минутах (не переписываем формат файла) — окно и
     # все интерактивные диалоги дальше работают в секундах, переводим только один раз здесь.
     default_interval = cfg["check_interval_minutes"] * 60
+
+    # ЗАПУСК_САМОЙ_ПРОГРАММЫ (self_update.py) — проверяем обновление самого AutoSync ДО открытия
+    # основного окна. Диалоги здесь простые, отдельные от таблицы репозиториев (у самообновления
+    # нет своей строки) — временный tk.Tk() только на время вопроса/сообщения, сразу закрывается.
+    _run_self_update_check()
 
     observer = Observer()
     watchers = [RepoWatcher(repo_cfg, dev_id, default_interval) for repo_cfg in cfg["repos"]]
