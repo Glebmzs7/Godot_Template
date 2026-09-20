@@ -10,7 +10,7 @@
       "watch_paths": [
         "Сам проект\\Godot_Template"
       ],
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "Life_Operator",
