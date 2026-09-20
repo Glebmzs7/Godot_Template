@@ -26,7 +26,8 @@
       "branch": "alpha/Mzs7",
       "watch_paths": [
         "Godot_Template_Power_struggle"
-      ]
+      ],
+      "enabled": false
     }
   ]
 }
