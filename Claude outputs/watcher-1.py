@@ -554,11 +554,23 @@ def _run_self_update_check() -> None:
         messagebox.showinfo("AutoSync — обновление", message)
         root.destroy()
 
-    def log_to_stderr(message: str) -> None:
-        # На этом шаге лог из окна (app.log) ещё недоступен — окно ещё не создано.
-        print(message)
+    # На этом шаге окна AutoSyncGUI ещё нет (app.log недоступен), поэтому пишем СРАЗУ в тот же
+    # файл autosync.log, который окно читает при старте (gui.py: _load_log_history) — так шаги
+    # самообновления видно и в самой программе, а не только в консоли (которой в .pyw-запуске и
+    # вовсе нет). Пишем ДО создания окна, поэтому эти строки попадут в подгруженную "историю"
+    # прямо перед меткой "── новый запуск программы ──", хоть и относятся к текущему запуску.
+    log_path = Path(__file__).resolve().parent / "autosync.log"
 
-    self_update.check_and_apply(ask_yes_no, notify_and_exit, log_to_stderr)
+    def log_update_step(message: str) -> None:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] [AutoSync] {message}"
+        print(line)
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass  # запись в файл не критична — сама проверка обновления при этом не прерывается
+
+    self_update.check_and_apply(ask_yes_no, notify_and_exit, log_update_step)
 
 
 def main(config_path_: Optional[str] = None) -> None:

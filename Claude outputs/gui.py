@@ -76,6 +76,31 @@ class PendingQuestion:
     result: object = None
 
 
+def _finalize_toplevel(win: tk.Toplevel) -> None:
+    """Известная особенность Tk на Windows: свежесозданный Toplevel иногда повисает БЕЗ рамки
+    вообще (ни свернуть, ни развернуть, ни крестика) в углу экрана — оконный менеджер просто не
+    перерисовывает рамку, пока не получит сигнал об изменении геометрии. Вручную это лечится
+    попыткой изменить размер окна мышью — здесь делаем то же самое программно: пересчитываем
+    размер под содержимое и переустанавливаем геометрию (заодно и по центру — раньше окно
+    оставалось там, где Windows его изначально поставило, обычно в верхнем левом/правом углу),
+    что форсирует Windows нарисовать нормальную рамку сразу, без участия пользователя."""
+    win.update_idletasks()
+    width = win.winfo_reqwidth()
+    height = win.winfo_reqheight()
+
+    # Центрируем относительно главного окна программы (а не относительно всего экрана — так
+    # диалог появляется рядом с тем окном, из которого его открыли, даже на нескольких мониторах).
+    owner = win.master.winfo_toplevel()
+    x = owner.winfo_rootx() + (owner.winfo_width() - width) // 2
+    y = owner.winfo_rooty() + (owner.winfo_height() - height) // 2
+    # На случай, если главное окно свёрнуто/за пределами экрана — не даём диалогу уйти в минус.
+    x, y = max(0, x), max(0, y)
+
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.lift()
+    win.focus_force()
+
+
 def _open_in_explorer(path: Path) -> None:
     if sys.platform == "win32":
         try:
@@ -98,7 +123,8 @@ class RepoRow(tk.Frame):
         # Колонки растягиваются РАВНОМЕРНО (uniform) вместе с окном — раньше ширина была
         # фиксированной в символах, и при узком окне текст последних колонок просто уезжал за
         # пределы видимой области (не было ни переноса, ни горизонтальной прокрутки).
-        for col in range(5):
+        # Колонка 5 — кнопка работает/ожидает/остановлена.
+        for col in range(6):
             self.grid_columnconfigure(col, weight=1, uniform="repo_row_cols")
 
         self.path_label = tk.Label(self, cursor="hand2", anchor="w")
@@ -125,11 +151,17 @@ class RepoRow(tk.Frame):
         self.saved_label.grid(row=0, column=3, sticky="ew", padx=(0, 8))
 
         self.countdown_label = tk.Label(self, anchor="e", cursor="hand2")
-        self.countdown_label.grid(row=0, column=4, sticky="ew")
+        self.countdown_label.grid(row=0, column=4, sticky="ew", padx=(0, 8))
         self.countdown_label.bind("<Button-3>", self._interval_menu)
 
+        # Работает (зелёная) / Ожидает (жёлтая — есть вопрос, требующий ответа, клик открывает
+        # тот же диалог, что и клик по красной строке) / Остановлена (красная — слежение и
+        # проверки для этого репозитория выключены пользователем, до повторного включения).
+        self.run_button = tk.Button(self, width=12, command=self._on_run_button_click)
+        self.run_button.grid(row=0, column=5, sticky="ew")
+
         self.status_label = tk.Label(self, anchor="w")
-        self.status_label.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(2, 0))
+        self.status_label.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(2, 0))
 
         for widget in (self, self.status_label, self.saved_label):
             widget.bind("<Button-1>", self._row_click, add="+")
@@ -193,6 +225,7 @@ class RepoRow(tk.Frame):
 
         entry.bind("<Return>", lambda e: submit())
         tk.Button(win, text="Применить (коммит + пуш сразу)", command=submit).pack(pady=(0, 12))
+        _finalize_toplevel(win)
 
     def _interval_menu(self, event):
         menu = tk.Menu(self, tearoff=0)
@@ -236,6 +269,17 @@ class RepoRow(tk.Frame):
         if seconds:
             self.watcher.check_interval_seconds = seconds
             self.watcher.next_check_at = time.time() + self.watcher.check_interval_seconds
+
+    def _on_run_button_click(self) -> None:
+        w = self.watcher
+        if w.pending_question is not None:
+            # Жёлтое состояние — это не переключатель, а напоминание об открытом вопросе: клик
+            # открывает тот же диалог заново, ровно как клик по красной строке.
+            self.app.reopen_pending(w)
+        elif w.running:
+            self.app.on_toggle_run(w, False)
+        else:
+            self.app.on_toggle_run(w, True)
 
     def _row_click(self, _event=None) -> None:
         if self.watcher.pending_question is not None:
@@ -291,6 +335,7 @@ class RepoRow(tk.Frame):
         tk.Button(win, text="Сохранить", command=submit).grid(
             row=len(rows), column=0, columnspan=2, pady=10
         )
+        _finalize_toplevel(win)
 
     # --- обновление вида -----------------------------------------------------------
 
@@ -311,10 +356,16 @@ class RepoRow(tk.Frame):
         self.saved_label.configure(text=w.last_saved_at)
         remaining = max(0, int(w.next_check_at - time.time()))
         mm, ss = divmod(remaining, 60)
-        self.countdown_label.configure(text=f"{mm:02d}:{ss:02d}")
+        self.countdown_label.configure(text=f"{mm:02d}:{ss:02d}" if w.running else "—:—")
         self.status_label.configure(text=f"{w.last_action} ({w.last_check_time})")
 
         needs_attention = w.pending_question is not None
+        if needs_attention:
+            self.run_button.configure(text="Ожидает", bg="#f6c343", activebackground="#f6c343")
+        elif w.running:
+            self.run_button.configure(text="Работает", bg="#4caf50", activebackground="#4caf50")
+        else:
+            self.run_button.configure(text="Остановлена", bg="#e05252", activebackground="#e05252")
         bg = "#f8d7da" if needs_attention else self.app.default_bg
         for widget in (self, self.status_label, self.saved_label, self.countdown_label,
                        self.version_frame, self.version_prefix_label, self.version_push_label,
@@ -325,11 +376,13 @@ class RepoRow(tk.Frame):
 class AutoSyncGUI:
     def __init__(self, watchers: list, on_add_repo: Callable[[dict], object],
                  on_edit_repo: Callable[..., None],
-                 on_manual_version_change: Callable[..., None]):
+                 on_manual_version_change: Callable[..., None],
+                 on_toggle_run: Callable[..., None]):
         self.watchers = watchers
         self._on_add_repo_cb = on_add_repo
         self._on_edit_repo_cb = on_edit_repo
         self._on_manual_version_change_cb = on_manual_version_change
+        self._on_toggle_run_cb = on_toggle_run
 
         self.root = tk.Tk()
         self.root.title("AutoSync")
@@ -372,7 +425,12 @@ class AutoSyncGUI:
         tk.Button(log_bar, text="Копировать весь лог", command=self._copy_log).pack(side="right")
         log_body = tk.Frame(log_container)
         log_body.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_body, state="disabled", wrap="word")
+        # state="disabled" в некоторых сборках Tk на Windows заодно ломает и обычное выделение
+        # мышью (работала только кнопка "Копировать весь лог") — вместо этого держим текст
+        # "normal" всегда, а от ручного редактирования защищаемся отдельно, блокируя клавиши
+        # (см. _block_log_editing ниже); выделение и Ctrl+C/Ctrl+A при этом работают как обычно.
+        self.log_text = tk.Text(log_body, wrap="word")
+        self.log_text.bind("<Key>", self._block_log_editing)
         log_scrollbar = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -387,6 +445,22 @@ class AutoSyncGUI:
 
         self._load_log_history()
         self._tick()
+
+    _LOG_NAV_KEYSYMS = {
+        "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+        "Shift_L", "Shift_R", "Control_L", "Control_R",
+    }
+
+    def _block_log_editing(self, event) -> Optional[str]:
+        """Лог должен оставаться читаемым мышью (выделение/Ctrl+C/Ctrl+A), но не редактируемым
+        с клавиатуры. Пропускаем клавиши навигации/выделения и Ctrl+C/Ctrl+A как есть, всё
+        остальное (обычный ввод, Delete/Backspace и т.п.) блокируем."""
+        if event.keysym in self._LOG_NAV_KEYSYMS:
+            return None
+        ctrl_pressed = bool(event.state & 0x4)
+        if ctrl_pressed and event.keysym.lower() in ("c", "a"):
+            return None
+        return "break"
 
     # --- вызывается из фоновых потоков (watcher.py) -----------------------------
 
@@ -413,11 +487,9 @@ class AutoSyncGUI:
         if not lines:
             return
         tail = lines[-_MAX_LOG_LINES:]
-        self.log_text.configure(state="normal")
         self.log_text.insert("end", "\n".join(tail) + "\n")
         self.log_text.insert("end", "── новый запуск программы ──\n")
         self.log_text.see("end")
-        self.log_text.configure(state="disabled")
 
     def ask_yes_no(self, watcher, message: str) -> bool:
         pq = PendingQuestion(kind="yes_no", message=message)
@@ -497,19 +569,20 @@ class AutoSyncGUI:
             tk.Button(buttons, text="Mergetool", width=14,
                       command=lambda: answer(SyncChoice.OPEN_MERGETOOL)).pack(side="left", padx=6)
 
+        _finalize_toplevel(win)
+
     def _append_log(self, line: str) -> None:
-        self.log_text.configure(state="normal")
         self.log_text.insert("end", line + "\n")
         line_count = int(self.log_text.index("end-1c").split(".")[0])
         if line_count > _MAX_LOG_LINES:
             self.log_text.delete("1.0", f"{line_count - _MAX_LOG_LINES}.0")
         self.log_text.see("end")
-        self.log_text.configure(state="disabled")
 
     def _copy_log(self) -> None:
-        # Выделение и Ctrl+C в самом Text и так работают даже при state="disabled" (запрещено
-        # только редактирование), но явная кнопка — надёжнее и заметнее, чем полагаться на то,
-        # что это очевидно.
+        # Отдельная кнопка "скопировать весь лог целиком" — быстрее, чем выделять мышью весь
+        # текст. Выделение конкретного куска мышью + Ctrl+C теперь тоже работает (см.
+        # _block_log_editing выше — раньше state="disabled" на некоторых сборках Tk блокировало
+        # и это тоже, оставляя рабочей только эту кнопку).
         self.root.clipboard_clear()
         self.root.clipboard_append(self.log_text.get("1.0", "end-1c"))
 
@@ -590,12 +663,16 @@ class AutoSyncGUI:
             win.destroy()
 
         tk.Button(win, text="Добавить", command=submit).grid(row=len(rows), column=0, columnspan=2, pady=10)
+        _finalize_toplevel(win)
 
     def on_edit_repo(self, watcher, **changes) -> None:
         self._on_edit_repo_cb(watcher, **changes)
 
     def manual_version_change(self, watcher, new_version) -> None:
         self._on_manual_version_change_cb(watcher, new_version)
+
+    def on_toggle_run(self, watcher, running: bool) -> None:
+        self._on_toggle_run_cb(watcher, running)
 
     def _tick(self) -> None:
         pending_count = sum(1 for w in self.watchers if w.pending_question is not None)
