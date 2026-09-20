@@ -101,6 +101,26 @@ def _finalize_toplevel(win: tk.Toplevel) -> None:
     win.focus_force()
 
 
+def _add_entry_context_menu(entry: tk.Entry) -> None:
+    """У полей ввода не было меню по правой кнопке мыши ("Вырезать/Копировать/Вставить") — это не
+    баг какой-то конкретной правки, а то, чего в tkinter нет само по себе (в отличие от Ctrl+C/V,
+    которые и раньше работали как обычно — tkinter привязывает их к полям ввода из коробки).
+    Добавляем стандартное контекстное меню, как в остальных программах Windows."""
+    menu = tk.Menu(entry, tearoff=0)
+    menu.add_command(label="Вырезать", command=lambda: entry.event_generate("<<Cut>>"))
+    menu.add_command(label="Копировать", command=lambda: entry.event_generate("<<Copy>>"))
+    menu.add_command(label="Вставить", command=lambda: entry.event_generate("<<Paste>>"))
+
+    def show_menu(event):
+        entry.focus_set()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    entry.bind("<Button-3>", show_menu)
+
+
 def _open_in_explorer(path: Path) -> None:
     if sys.platform == "win32":
         try:
@@ -215,9 +235,13 @@ class RepoRow(tk.Frame):
         entry.pack(padx=12, pady=(0, 12), fill="x")
         entry.select_range(0, "end")
         entry.focus_set()
+        _add_entry_context_menu(entry)
 
         def submit():
-            new_prefix = entry.get().strip()
+            # rstrip(",") — висячая запятая на конце (например "0.0,0.0,0.7,0,") иначе даёт тег
+            # с двойной запятой на конце (version.build_tag сама добавляет ",0"): работать он бы
+            # работал, но выглядит как опечатка, поэтому просто убираем лишнее.
+            new_prefix = entry.get().strip().rstrip(",")
             if not new_prefix:
                 return
             self.app.manual_version_change(self.watcher, new_prefix)
@@ -313,6 +337,7 @@ class RepoRow(tk.Frame):
             entry = tk.Entry(win, width=40)
             entry.insert(0, current)
             entry.grid(row=i, column=1, padx=8, pady=4)
+            _add_entry_context_menu(entry)
             fields[key] = entry
 
         def submit():
@@ -686,6 +711,7 @@ class AutoSyncGUI:
             )
             entry = tk.Entry(win, width=40)
             entry.grid(row=i, column=1, padx=8, pady=4)
+            _add_entry_context_menu(entry)
             fields[key] = entry
         fields["interval"].insert(0, "1800")
 

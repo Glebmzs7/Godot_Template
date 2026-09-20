@@ -48,6 +48,14 @@ def current_branch(repo_path: Path) -> str:
     return _run(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
 
 
+def rev_parse(repo_path: Path, ref: str) -> str:
+    """Полный хэш коммита, на который указывает ref (HEAD, origin/<branch>, тег и т.п.) —
+    однозначная проверка "это тот же коммит или нет", без неоднозначностей git describe (см.
+    _action_push в watcher.py: раньше проверка после пуша сравнивала теги через describe, что
+    ломалось, если на одном и том же коммите оказывалось НЕСКОЛЬКО тегов)."""
+    return _run(repo_path, "rev-parse", ref)
+
+
 def remote_url(repo_path: Path, remote: str = "origin") -> Optional[str]:
     """Для ссылки на git в окне (пункт 2 списка строки) — берём как есть, что настроено у git,
     без своих догадок."""

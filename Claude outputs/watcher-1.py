@@ -327,15 +327,29 @@ class RepoWatcher(FileSystemEventHandler):
             )
             return
 
+        # Проверяем ПО КОММИТУ (rev-parse), а не по "последнему тегу веткиHEAD" (git describe) —
+        # раньше здесь сравнивали confirmed_tag == tag через git_ops.latest_tag_on_branch
+        # (git describe --tags --abbrev=0). Это ломалось всякий раз, когда пуш не создавал новый
+        # коммит (например ручное изменение версии без реальных файловых изменений, force-push
+        # без нового содержимого) — тег вешался на УЖЕ существующий коммит, у которого мог быть и
+        # старый тег, и describe был не обязан вернуть именно наш новый тег (какой из нескольких
+        # тегов на одном коммите он выберет — не гарантировано). Из-за этого проверка постоянно
+        # решала "версия не совпала" и уходила в слияние по кругу, даже после force-push
+        # ("оставить локальную версию") — именно это и было зацикливание у Life_Operator.
+        # Раз push_atomic() уже не бросил ошибку — и ветка, и тег гарантированно приняты сервером
+        # ОДНОЙ операцией; остаётся проверить только то, что реально может быть не так: что HEAD
+        # действительно совпадает с origin/<ветка> и что за время пуша не появилось новых
+        # локальных изменений (гонка с сохранением файла).
         try:
             git_ops.fetch(self.repo_path)
-            confirmed = git_ops.latest_tag_on_branch(self.repo_path, f"origin/{self.branch}")
+            local_head = git_ops.rev_parse(self.repo_path, "HEAD")
+            remote_head = git_ops.rev_parse(self.repo_path, f"origin/{self.branch}")
         except git_ops.GitError as e:
             self.last_action = "ошибка проверки после пуша"
             log(self.name, f"Результат: пуш прошёл, но проверка после пуша не удалась — {e}")
             return
 
-        if confirmed == tag and not git_ops.has_local_changes(self.repo_path):
+        if local_head == remote_head and not git_ops.has_local_changes(self.repo_path):
             self._accept_version(tag)
             self.last_check_time = _now_str()
             self.last_action = "синхронизировано"
