@@ -397,7 +397,9 @@ class RepoWatcher(FileSystemEventHandler):
         log(self.name, "Передаём синхронизацию (commit + push)...")
 
         try:
-            if git_ops.has_local_changes(self.repo_path):
+            changed = git_ops.changed_files(self.repo_path)
+            if changed:
+                log(self.name, "Файлы, которые считаются материалом для пуша:\n" + "\n".join(changed))
                 git_ops.add_commit(self.repo_path, ["."], message=reason)
         except git_ops.GitError as e:
             self.last_check_time = _now_str()

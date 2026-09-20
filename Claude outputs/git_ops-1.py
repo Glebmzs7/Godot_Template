@@ -15,11 +15,33 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 class GitError(RuntimeError):
     pass
+
+
+# Необязательный колбэк (repo_path, command_str) -> None, устанавливается один раз из watcher.py
+# (см. _log_git_command / git_ops.set_command_logger), чтобы КАЖДАЯ выполняемая git-команда была
+# видна пользователю в журнале программы, а не только итоговый результат ("синхронизировано" и
+# т.п.) — программа запускается без консоли (AutoSync.pyw), поэтому это единственное место, где
+# пользователь может увидеть, какими именно git-командами мы пользуемся.
+_command_logger: Optional[Callable[[Path, str], None]] = None
+
+
+def set_command_logger(callback: Callable[[Path, str], None]) -> None:
+    global _command_logger
+    _command_logger = callback
+
+
+def _log_command(repo_path: Path, command: str) -> None:
+    if _command_logger is None:
+        return
+    try:
+        _command_logger(repo_path, command)
+    except Exception:
+        pass  # логирование команды не должно ломать саму git-операцию
 
 
 # На Windows каждый subprocess.run(["git", ...]) без этого флага открывает своё маленькое
@@ -30,6 +52,7 @@ _NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _run(repo_path: Path, *args: str) -> str:
+    _log_command(repo_path, " ".join(args))
     result = subprocess.run(
         ["git", "-C", str(repo_path), *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -85,6 +108,15 @@ def diff_name_status(repo_path: Path, ref_a: str, ref_b: str) -> List[str]:
 
 def has_local_changes(repo_path: Path) -> bool:
     return bool(_run(repo_path, "status", "--porcelain"))
+
+
+def changed_files(repo_path: Path) -> List[str]:
+    """То же самое, что видит has_local_changes(), но построчно — какие именно файлы git считает
+    изменёнными/новыми/удалёнными. Используется только для логирования (см. watcher.py —
+    _action_push), чтобы пользователь мог увидеть, какой конкретно файл вызвал пуш, а не только
+    сам факт "есть материал для пуша"."""
+    out = _run(repo_path, "status", "--porcelain")
+    return out.splitlines() if out else []
 
 
 def add_commit(repo_path: Path, paths: List[str], message: str) -> None:
@@ -148,11 +180,21 @@ def latest_tag_on_branch(repo_path: Path, branch: Optional[str] = None) -> Optio
         return None  # тегов ещё нет
 
 
+def unmerged_files(repo_path: Path) -> List[str]:
+    """Файлы, реально находящиеся в состоянии конфликта (unmerged) прямо сейчас. Используется,
+    чтобы предупредить пользователя ДО открытия mergetool, если конфликтов нет — тогда mergetool
+    откроется и сразу закроется сам, ему нечего показывать (см. watcher.py —
+    _process_slияniya_raskhozhdeniy)."""
+    out = _run(repo_path, "diff", "--name-only", "--diff-filter=U")
+    return out.splitlines() if out else []
+
+
 def open_mergetool(repo_path: Path) -> None:
     """Открыть настроенный у пользователя инструмент слияния конфликтов.
 
     Ничего не решает сам — просто передаёт управление git/внешнему diff-инструменту.
     """
+    _log_command(repo_path, "mergetool")
     subprocess.run(["git", "-C", str(repo_path), "mergetool"])
 
 
