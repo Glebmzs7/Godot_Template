@@ -480,6 +480,26 @@ def _start_watch_and_check(watcher: RepoWatcher) -> None:
     _run_check(watcher, REASON_START, "Проверка после включения...")
 
 
+def delete_repo_runtime(watcher: RepoWatcher) -> None:
+    """Кнопка 'Удалить репозиторий...' в окне 'Изменить репозиторий...' (после двойного
+    подтверждения). Ничего на диске не трогаем — только снимаем слежение, убираем запись из
+    config.json и из окна. Снятие слежения — в фоне, по той же причине, что и у
+    set_repo_running_runtime (unschedule может ждать текущую git-операцию/диалог)."""
+    watcher.running = False
+    for i, repo_cfg in enumerate(cfg.get("repos", [])):
+        if repo_cfg["name"] == watcher.name:
+            del cfg["repos"][i]
+            break
+    _save_config()
+    log(watcher.name, "Репозиторий удалён из слежения пользователем")
+
+    def _unwatch_and_remove() -> None:
+        _unregister_watch(watcher)
+        app.remove_row_for(watcher)
+
+    threading.Thread(target=_unwatch_and_remove, daemon=True).start()
+
+
 def manual_version_change_runtime(watcher: RepoWatcher, new_prefix: str) -> None:
     """Вызывается из окна ('Изменить версию...') — сама git-операция идёт в фоновом потоке,
     чтобы не подвешивать окно на время commit+push."""
@@ -603,6 +623,7 @@ def main(config_path_: Optional[str] = None) -> None:
         on_edit_repo=edit_repo_runtime,
         on_manual_version_change=manual_version_change_runtime,
         on_toggle_run=set_repo_running_runtime,
+        on_delete_repo=delete_repo_runtime,
     )
 
     # Слежение и проверки идут в фоне, окно — на главном потоке (обязательное требование tkinter).

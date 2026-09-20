@@ -335,6 +335,53 @@ class RepoRow(tk.Frame):
         tk.Button(win, text="Сохранить", command=submit).grid(
             row=len(rows), column=0, columnspan=2, pady=10
         )
+        tk.Button(
+            win, text="Удалить репозиторий...", fg="#a4000f",
+            command=lambda: self._confirm_delete_step1(win, w),
+        ).grid(row=len(rows) + 1, column=0, columnspan=2, pady=(0, 10))
+        _finalize_toplevel(win)
+
+    def _confirm_delete_step1(self, edit_win: tk.Toplevel, w) -> None:
+        """Удаление — с двойным подтверждением (случайный клик не должен убрать репозиторий из
+        слежения): первое окно объясняет, что именно произойдёт, второе — просто "точно?"."""
+        win = tk.Toplevel(self)
+        win.title(f"Удалить репозиторий — {w.name}")
+        tk.Label(
+            win,
+            text=f"Убрать «{w.name}» из слежения AutoSync?\n\n"
+                 "Сама папка и git-репозиторий на диске НЕ удаляются — пропадёт только запись\n"
+                 "в этой программе (строка в окне, config.json). Добавить обратно можно будет\n"
+                 "кнопкой «+», как и любой другой репозиторий.",
+            justify="left", wraplength=380,
+        ).pack(padx=16, pady=16)
+        buttons = tk.Frame(win)
+        buttons.pack(pady=(0, 12))
+        tk.Button(
+            buttons, text="Удалить", width=12, fg="#a4000f",
+            command=lambda: (win.destroy(), self._confirm_delete_step2(edit_win, w)),
+        ).pack(side="left", padx=8)
+        tk.Button(buttons, text="Отмена", width=12, command=win.destroy).pack(side="left", padx=8)
+        _finalize_toplevel(win)
+
+    def _confirm_delete_step2(self, edit_win: tk.Toplevel, w) -> None:
+        win = tk.Toplevel(self)
+        win.title("Подтвердите ещё раз")
+        tk.Label(
+            win, text=f"Точно удалить «{w.name}»?",
+            justify="left", fg="#a4000f", font=("TkDefaultFont", 10, "bold"),
+        ).pack(padx=16, pady=16)
+        buttons = tk.Frame(win)
+        buttons.pack(pady=(0, 12))
+
+        def confirm():
+            win.destroy()
+            edit_win.destroy()
+            self.app.on_delete_repo(w)
+
+        tk.Button(buttons, text="Да, удалить", width=14, fg="#a4000f", command=confirm).pack(
+            side="left", padx=8
+        )
+        tk.Button(buttons, text="Отмена", width=12, command=win.destroy).pack(side="left", padx=8)
         _finalize_toplevel(win)
 
     # --- обновление вида -----------------------------------------------------------
@@ -377,12 +424,14 @@ class AutoSyncGUI:
     def __init__(self, watchers: list, on_add_repo: Callable[[dict], object],
                  on_edit_repo: Callable[..., None],
                  on_manual_version_change: Callable[..., None],
-                 on_toggle_run: Callable[..., None]):
+                 on_toggle_run: Callable[..., None],
+                 on_delete_repo: Callable[..., None]):
         self.watchers = watchers
         self._on_add_repo_cb = on_add_repo
         self._on_edit_repo_cb = on_edit_repo
         self._on_manual_version_change_cb = on_manual_version_change
         self._on_toggle_run_cb = on_toggle_run
+        self._on_delete_repo_cb = on_delete_repo
 
         self.root = tk.Tk()
         self.root.title("AutoSync")
@@ -673,6 +722,21 @@ class AutoSyncGUI:
 
     def on_toggle_run(self, watcher, running: bool) -> None:
         self._on_toggle_run_cb(watcher, running)
+
+    def on_delete_repo(self, watcher) -> None:
+        self._on_delete_repo_cb(watcher)
+
+    def remove_row_for(self, watcher) -> None:
+        """Вызывается из фонового потока (watcher.py: delete_repo_runtime) после того, как
+        слежение снято — сама уборка виджета и списка watchers идёт в главном потоке."""
+        self.root.after(0, self._remove_row, watcher)
+
+    def _remove_row(self, watcher) -> None:
+        row = self._rows.pop(id(watcher), None)
+        if row is not None:
+            row.destroy()
+        if watcher in self.watchers:
+            self.watchers.remove(watcher)
 
     def _tick(self) -> None:
         pending_count = sum(1 for w in self.watchers if w.pending_question is not None)
