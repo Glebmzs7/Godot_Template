@@ -1,0 +1,26 @@
+{
+  "_комментарий": "path — это корень git-репозитория (там, где лежит .git). У всех проектов (Godot_Template, Life_Operator, Power_struggle) это верхняя папка проекта целиком, НЕ 'Сам проект'. watch_paths [\"\"] значит следим за ВСЕЙ папкой репозитория — безопасно благодаря ignored_folders ниже (.git и .autosync_data исключены всегда, остальное можно дописывать сюда самому).",
+  "dev_id": 7,
+  "check_interval_minutes": 30,
+  "ignored_folders": [".godot", "__pycache__"],
+  "repos": [
+    {
+      "name": "Godot_Template",
+      "path": "C:\\Users\\Бог\\YandexDisk-volov7gleb\\Проекты\\IT\\Godot_Template",
+      "branch": "alpha/Mzs7",
+      "watch_paths": [
+        ""
+      ],
+      "enabled": true
+    },
+    {
+      "name": "Life_Operator",
+      "path": "C:\\Users\\Бог\\YandexDisk-volov7gleb\\Проекты\\IT\\Программы\\Life_Operator",
+      "branch": "alpha/Mzs7",
+      "watch_paths": [
+        ""
+      ],
+      "enabled": true
+    }
+  ]
+}

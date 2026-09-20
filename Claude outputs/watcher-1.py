@@ -48,6 +48,7 @@ from watchdog.observers import Observer
 
 import git_ops
 import notifier
+import repo_data
 import self_update
 import state
 import version
@@ -83,12 +84,35 @@ def _is_ignored(filename: str) -> bool:
     return any(fnmatch.fnmatch(filename, pattern) for pattern in IGNORE_PATTERNS)
 
 
+# Папки, которые НИКОГДА не должны триггерить пуш, независимо от того, что именно в них
+# изменилось — не маски имён файлов (это IGNORE_PATTERNS выше), а целые папки, узнаваемые по
+# имени на любом уровне пути (см. on_modified). ".git" и папка данных repo_data.py —
+# обязательные, их нельзя убрать даже правкой config.json (см. комментарий в on_modified).
+_MANDATORY_IGNORED_FOLDERS = {".git", repo_data.DATA_DIRNAME}
+
+
+def _ignored_folders() -> set:
+    """Объединяет обязательный список с необязательным config["ignored_folders"] — пользователь
+    может дописывать туда свои папки сам, правкой config.json, без изменения кода программы."""
+    return _MANDATORY_IGNORED_FOLDERS | set(cfg.get("ignored_folders", []))
+
+
 def _now_str() -> str:
     return datetime.now().strftime("%H:%M:%S %d/%m/%Y")
 
 
 def log(repo_name: str, message: str) -> None:
     app.log(repo_name, message)
+
+
+def _log_git_command(repo_path: Path, command: str) -> None:
+    """Прокидывается в git_ops.py (см. set_command_logger) — программа запускается без консоли
+    (AutoSync.pyw), поэтому это единственный способ показать пользователю в журнале, какие именно
+    git-команды выполняются, не только итоговый результат."""
+    log(Path(repo_path).name, f"git {command}")
+
+
+git_ops.set_command_logger(_log_git_command)
 
 
 def _save_config() -> None:
@@ -126,6 +150,15 @@ class RepoWatcher(FileSystemEventHandler):
         self.pending_question = None  # выставляется/снимается в gui.py (AutoSyncGUI)
         self._remote_url_cache: Optional[str] = None
 
+        # Данные репозитория (ветка/интервал/версия) дублируются ВНУТРИ самого репозитория —
+        # см. repo_data.py — чтобы "путешествовать" вместе с проектом на другую машину.
+        # Расхождение с центральным config.json/state.json не разрешаем сами — спрашиваем
+        # пользователя (см. _reconcile_repo_data_on_start/resolve_repo_data_conflict,
+        # gui.py — ask_repo_data_conflict; сам вопрос задаётся из _background_start, а не
+        # отсюда — на этом шаге окно AutoSyncGUI ещё не создано).
+        self._repo_data_conflict: Optional[dict] = None  # {"central": {...}, "folder": {...}}
+        self._reconcile_repo_data_on_start()
+
     @property
     def full_watch_path(self) -> Path:
         return self.repo_path / self.watch_paths[0]
@@ -142,6 +175,87 @@ class RepoWatcher(FileSystemEventHandler):
         state.save_known_version(self.name, tag)
         self.current_tag = tag
         self.last_saved_at = _now_str()
+        self._save_repo_data()
+
+    # --- дублирование данных репозитория в .autosync_data (repo_data.py) --------------------
+
+    def _central_repo_data(self) -> dict:
+        return {
+            "name": self.name,
+            "branch": self.branch,
+            "check_interval_minutes": round(self.check_interval_seconds / 60),
+            "known_version": self.known_version,
+        }
+
+    def _save_repo_data(self) -> None:
+        try:
+            repo_data.save(self.repo_path, saved_at=_now_str(), **self._central_repo_data())
+        except OSError as e:
+            log(self.name, f"Не удалось записать данные в папку проекта (.autosync_data): {e}")
+
+    def _reconcile_repo_data_on_start(self) -> None:
+        """Вызывается один раз при создании RepoWatcher (запуск программы или добавление нового
+        репозитория). Если .autosync_data ещё нет — создаём из текущих данных (для нового
+        репозитория это и есть "перенос данных" — делается автоматически, без ручных команд).
+        Если есть, но расходится — ничего не решаем сами, только запоминаем расхождение;
+        сам вопрос пользователю задаётся позже, из _background_start (см. там)."""
+        # Автоматически поддерживаем исключение .autosync_data/ в .gitignore репозитория — не
+        # коммитим этот файл в git (у каждого пользователя своя ветка), и делаем это без ручной
+        # правки .gitignore при каждом новом репозитории (см. repo_data.ensure_gitignore_entry).
+        repo_data.ensure_gitignore_entry(self.repo_path)
+
+        central = self._central_repo_data()
+        try:
+            folder = repo_data.load(self.repo_path)
+        except OSError:
+            folder = None
+
+        if folder is None:
+            self._save_repo_data()
+            return
+
+        if repo_data.matches(folder, central):
+            return
+
+        log(self.name, "Данные в .autosync_data (в папке проекта) расходятся с config.json — нужен выбор")
+        self._repo_data_conflict = {"central": central, "folder": folder}
+
+    def resolve_repo_data_conflict(self, take: str) -> None:
+        """take == 'central' (общий config.json) или 'folder' (.autosync_data в папке проекта).
+        Вызывается из watcher._ask_repo_data_conflict после ответа пользователя в окне."""
+        conflict = self._repo_data_conflict
+        self._repo_data_conflict = None
+        if conflict is None:
+            return
+
+        if take == "folder":
+            folder = conflict["folder"]
+            new_branch = folder.get("branch") or self.branch
+            self.branch = new_branch
+            self._remote_url_cache = None
+
+            interval_min = folder.get("check_interval_minutes")
+            if interval_min:
+                self.check_interval_seconds = interval_min * 60
+                self.next_check_at = time.time() + self.check_interval_seconds
+
+            known = folder.get("known_version")
+            if known:
+                self.known_version = known
+                state.save_known_version(self.name, known)
+                self.current_tag = known
+
+            for repo_cfg in cfg.get("repos", []):
+                if repo_cfg["name"] == self.name:
+                    repo_cfg["branch"] = self.branch
+                    break
+            _save_config()
+            log(self.name, "Выбор пользователя: взять данные из папки проекта (.autosync_data)")
+        else:
+            log(self.name, "Выбор пользователя: оставить данные из общего config.json")
+
+        self._save_repo_data()
+        _run_check(self, REASON_START, "Первичная проверка синхронизации с GitHub...")
 
     # --- события файловой системы ------------------------------------------------
 
@@ -157,6 +271,18 @@ class RepoWatcher(FileSystemEventHandler):
             return  # это собственный служебный файл AutoSync (лог/состояние/кэш) — не код проекта
         except ValueError:
             pass  # путь не внутри папки AutoSync — обычное событие, обрабатываем как раньше
+
+        # Целые служебные папки, которые не должны триггерить пуш ни при каких обстоятельствах —
+        # не по имени файла (см. IGNORE_PATTERNS/_is_ignored ниже), а по имени папки на ЛЮБОМ
+        # уровне пути. ".git" и ".autosync_data" — обязательные (нельзя убрать даже правкой
+        # config.json): ".git" сам постоянно меняет свои файлы (FETCH_HEAD, logs/HEAD) при каждом
+        # нашем же git fetch — без исключения это давало бесконечный цикл проверок при слежении за
+        # ВСЕЙ папкой репозитория (найдено 21.09 на Life_Operator — по несколько циклов в секунду);
+        # ".autosync_data" — наша же папка с данными репозитория (repo_data.py), по той же причине.
+        # Остальное — необязательный список из config.json ("ignored_folders"), пользователь может
+        # дописывать туда свои папки сам, без правки кода (например ".godot", "__pycache__" и т.п.).
+        if any(part in _ignored_folders() for part in src_path.parts):
+            return
 
         filename = src_path.name
         if _is_ignored(filename):
@@ -375,6 +501,14 @@ class RepoWatcher(FileSystemEventHandler):
                 self._action_update_local(git_version)
         else:
             log(self.name, "Выбор пользователя: открыть mergetool")
+            unmerged = git_ops.unmerged_files(self.repo_path)
+            if not unmerged:
+                log(
+                    self.name,
+                    "Внимание: git не видит файлов в состоянии реального конфликта — mergetool, "
+                    "скорее всего, откроется и сразу закроется сам (показывать нечего). Это не "
+                    "ошибка mergetool — открываем его всё равно, на случай если git считает иначе.",
+                )
             git_ops.open_mergetool(self.repo_path)
             log(self.name, "Mergetool закрыт — перепроверяем состояние")
 
@@ -451,6 +585,7 @@ def edit_repo_runtime(watcher: RepoWatcher, name: Optional[str] = None, path: Op
             _register_watch(watcher)
         break
     _save_config()
+    watcher._save_repo_data()
     log(watcher.name, "Настройки репозитория изменены")
 
 
@@ -558,15 +693,31 @@ def _background_start(watchers: list) -> None:
     # этот вопрос кто-то не ответит — снаружи это выглядело как "программа зависла, отсчёт не
     # идёт". Теперь periodic_check_loop стартует сразу, независимо от того, ждут ли ответа
     # какие-то репозитории.
+    #
+    # Если для репозитория ещё на старте (в __init__ -> _reconcile_repo_data_on_start) нашлось
+    # расхождение между config.json и .autosync_data в папке проекта — сперва спрашиваем
+    # пользователя (окно AutoSyncGUI к этому моменту уже создано), обычная первичная проверка
+    # для него запустится сама, уже после ответа (см. resolve_repo_data_conflict).
     for w in watchers:
         if not w.running:
             continue
-        threading.Thread(
-            target=_run_check, args=(w, REASON_START, "Первичная проверка синхронизации с GitHub..."),
-            daemon=True,
-        ).start()
+        if w._repo_data_conflict is not None:
+            threading.Thread(target=_ask_repo_data_conflict, args=(w,), daemon=True).start()
+        else:
+            threading.Thread(
+                target=_run_check, args=(w, REASON_START, "Первичная проверка синхронизации с GitHub..."),
+                daemon=True,
+            ).start()
 
     threading.Thread(target=periodic_check_loop, args=(watchers,), daemon=True).start()
+
+
+def _ask_repo_data_conflict(watcher: "RepoWatcher") -> None:
+    conflict = watcher._repo_data_conflict
+    if conflict is None:
+        return
+    choice = app.ask_repo_data_conflict(watcher, conflict["central"], conflict["folder"])
+    watcher.resolve_repo_data_conflict(choice)
 
 
 def _run_self_update_check() -> None:
