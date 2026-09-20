@@ -12,6 +12,7 @@ Beyond Compare, kdiff3, meld и т.п. — либо оставит тексто�
 """
 
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -21,10 +22,18 @@ class GitError(RuntimeError):
     pass
 
 
+# На Windows каждый subprocess.run(["git", ...]) без этого флага открывает своё маленькое
+# консольное окно (мелькает и сразу закрывается) — при частых проверках нескольких репозиториев
+# это и даёт "очень много окон" при запуске. CREATE_NO_WINDOW убирает именно консоль команды,
+# не трогая работу самой команды. На других ОС такого флага нет — там просто 0 (по умолчанию).
+_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 def _run(repo_path: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo_path), *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=_NO_WINDOW_FLAGS,
     )
     if result.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed in {repo_path}:\n{result.stderr}")
@@ -92,6 +101,35 @@ def create_and_push_tag(repo_path: Path, tag: str, message: str, remote: str = "
         raise GitError(f"Тег {tag!r} уже существует — коллизия версии, нужно решение пользователя")
     _run(repo_path, "tag", "-a", tag, "-m", message)
     _run(repo_path, "push", remote, tag)
+
+
+def create_tag(repo_path: Path, tag: str, message: str) -> None:
+    """Только локально — создать тег, БЕЗ пуша (используется вместе с push_atomic, чтобы ветка и
+    тег уходили на сервер одной командой)."""
+    if tag_exists(repo_path, tag):
+        raise GitError(f"Тег {tag!r} уже существует — коллизия версии, нужно решение пользователя")
+    _run(repo_path, "tag", "-a", tag, "-m", message)
+
+
+def delete_local_tag(repo_path: Path, tag: str) -> None:
+    """Убрать локальный тег, который не удалось (атомарно) запушить — чтобы следующая попытка
+    со следующим номером пуша не спотыкалась о него как о 'уже существующий'."""
+    try:
+        _run(repo_path, "tag", "-d", tag)
+    except GitError:
+        pass  # тега и так нет — ничего страшного
+
+
+def push_atomic(repo_path: Path, branch: str, tag: str, remote: str = "origin", force: bool = False) -> None:
+    """Пушим ветку и тег ОДНОЙ атомарной командой (git push --atomic): git либо принимает ОБА
+    ref-а, либо (при отклонении любого из них — коллизия на сервере, разрыв связи, отставшая
+    ветка и т.п.) НЕ принимает НИ ОДНОГО. Так код никогда не окажется на GitHub без версии,
+    и наоборот — тег никогда не появится без соответствующего ему кода."""
+    args = ["push", "--atomic"]
+    if force:
+        args.append("--force-with-lease")
+    args += [remote, branch, tag]
+    _run(repo_path, *args)
 
 
 def latest_tag_on_branch(repo_path: Path, branch: Optional[str] = None) -> Optional[str]:
