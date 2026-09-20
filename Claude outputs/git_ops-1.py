@@ -189,6 +189,22 @@ def unmerged_files(repo_path: Path) -> List[str]:
     return out.splitlines() if out else []
 
 
+def is_tracked(repo_path: Path, relpath: str) -> bool:
+    """Отслеживается ли git-ом путь (файл или папка) внутри репозитория. Нужно для случая, когда
+    .autosync_data успел закоммититься ДО того, как появилось исключение в .gitignore — само
+    .gitignore не снимает с учёта уже отслеживаемые файлы (см. watcher.py —
+    _reconcile_repo_data_on_start)."""
+    out = _run(repo_path, "ls-files", "--", relpath)
+    return bool(out)
+
+
+def untrack_path(repo_path: Path, relpath: str) -> None:
+    """git rm -r --cached: убирает путь из индекса git (переводит в untracked), НЕ трогая сам
+    файл/папку на диске. Изменение остаётся застейдженным и уйдёт в git вместе со следующим
+    обычным коммитом (см. add_commit в watcher.py)."""
+    _run(repo_path, "rm", "-r", "--cached", "--ignore-unmatch", relpath)
+
+
 def open_mergetool(repo_path: Path) -> None:
     """Открыть настроенный у пользователя инструмент слияния конфликтов.
 

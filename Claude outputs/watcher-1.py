@@ -199,10 +199,31 @@ class RepoWatcher(FileSystemEventHandler):
         репозитория это и есть "перенос данных" — делается автоматически, без ручных команд).
         Если есть, но расходится — ничего не решаем сами, только запоминаем расхождение;
         сам вопрос пользователю задаётся позже, из _background_start (см. там)."""
+        # Прозрачность при подключении: к какому именно репозиторию/GitHub-адресу и какой ветке
+        # мы обращаемся — попросили показывать это сразу, а не только по клику на строку.
+        remote = git_ops.remote_url(self.repo_path) or "(не удалось определить — remote не настроен?)"
+        log(self.name, f"Репозиторий: путь={self.repo_path}, ветка={self.branch!r}, GitHub={remote}")
+
         # Автоматически поддерживаем исключение .autosync_data/ в .gitignore репозитория — не
         # коммитим этот файл в git (у каждого пользователя своя ветка), и делаем это без ручной
         # правки .gitignore при каждом новом репозитории (см. repo_data.ensure_gitignore_entry).
         repo_data.ensure_gitignore_entry(self.repo_path)
+
+        # .gitignore НЕ снимает с учёта то, что git уже когда-то закоммитил ДО появления этого
+        # исключения — если .autosync_data успел попасть в git раньше (обнаружено 21.09у
+        # Godot_Template — коммитился и пушился на GitHub каждый раз), сам .gitignore тут
+        # бессилен. Проверяем и один раз убираем из индекса автоматически — дальше .gitignore не
+        # даст этому повториться. Файлы на диске не трогаются, только git перестаёт их отслеживать.
+        try:
+            if git_ops.is_tracked(self.repo_path, repo_data.DATA_DIRNAME):
+                git_ops.untrack_path(self.repo_path, repo_data.DATA_DIRNAME)
+                log(
+                    self.name,
+                    f"{repo_data.DATA_DIRNAME} был случайно закоммичен в git ранее — убран из "
+                    f"индекса (файлы на диске не тронуты, уйдёт из GitHub со следующим пушем)",
+                )
+        except git_ops.GitError as e:
+            log(self.name, f"Не удалось проверить/убрать {repo_data.DATA_DIRNAME} из git-индекса: {e}")
 
         central = self._central_repo_data()
         try:
@@ -258,14 +279,23 @@ class RepoWatcher(FileSystemEventHandler):
         _run_check(self, REASON_START, "Первичная проверка синхронизации с GitHub...")
 
     # --- события файловой системы ------------------------------------------------
+    #
+    # watchdog различает 4 вида событий: on_modified (файл изменили), on_created (новый файл),
+    # on_deleted (удалили), on_moved (переименовали/переместили). Раньше был обработан только
+    # on_modified — значит, если пользователь ТОЛЬКО добавлял новый файл или ТОЛЬКО удалял/
+    # переименовывал, ничего больше не трогая, пуш мог не запуститься вовсе. Все четыре события
+    # теперь идут через один и тот же общий разбор (_handle_fs_event) — с теми же проверками
+    # (своя папка AutoSync, .git/.autosync_data/config.json-список, маски временных файлов).
 
-    def on_modified(self, event):
+    def _handle_fs_event(self, event, event_label: str) -> None:
         if not self.running:
             return  # на всякий случай — по идее watch уже снят, событие сюда не должно прийти
         if event.is_directory:
-            return
+            return  # саму папку не коммитим — отдельные файлы внутри неё дадут свои события
 
-        src_path = Path(event.src_path)
+        # У on_moved путь назначения — dest_path (новое имя/место), у остальных — src_path.
+        raw_path = getattr(event, "dest_path", None) or event.src_path
+        src_path = Path(raw_path)
         try:
             src_path.resolve().relative_to(_AUTOSYNC_DIR)
             return  # это собственный служебный файл AutoSync (лог/состояние/кэш) — не код проекта
@@ -287,8 +317,20 @@ class RepoWatcher(FileSystemEventHandler):
         filename = src_path.name
         if _is_ignored(filename):
             return
-        log(self.name, f"Есть материал для пуша: {event.src_path}")
+        log(self.name, f"Есть материал для пуша ({event_label}): {raw_path}")
         self.sverka_versiy(REASON_PUSH)
+
+    def on_modified(self, event):
+        self._handle_fs_event(event, "изменён")
+
+    def on_created(self, event):
+        self._handle_fs_event(event, "создан")
+
+    def on_deleted(self, event):
+        self._handle_fs_event(event, "удалён")
+
+    def on_moved(self, event):
+        self._handle_fs_event(event, "перемещён/переименован")
 
     # --- СВЕРКА_ВЕРСИЙ и действия ---------------------------------------------------
 
