@@ -1,3 +1,5 @@
-.obsidian/
 Сам проект/.git-artifacts-old/
 /.autosync_data/
+
+# Секреты Google OAuth зашиты автором плагина в main.js — см. Уведомление_IT_10.10.md, пункт 3.
+.obsidian/plugins/remotely-save/main.js
