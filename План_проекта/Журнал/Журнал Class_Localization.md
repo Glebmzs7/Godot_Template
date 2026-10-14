@@ -9,6 +9,10 @@ subject: "[[Class_Localization]]"
 
 ## Записи
 
+### 2026-09-27 — добавлен ключ ACCOUNT_PICKER_TITLE
+
+В `Localization/Localization.csv` после `SUPPORT_TITLE` добавлена строка `ACCOUNT_PICKER_TITLE,Выбор аккаунта,Select account,Konto auswählen,Choisir un compte,Seleccionar cuenta`. Ключ использовался в окне выбора аккаунта ([[Сцена Start_Program]]), но перевода не было — на экране был виден сырой ключ. Сверка 27.09: теперь все ключи, используемые в `Start_Program.gd`, есть в CSV.
+
 ### 2026-09-26 — документация разделена на Документы и Журнал
 
 Документ [[Class_Localization]] создан впервые (раньше отдельного описания не было), по текущему коду (сверка 26.09). Подробности — [[Журнал Документации]].

@@ -13,7 +13,7 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "План проекта/Class_Logger.md",
+                "file": "План_проекта/Class_Logger.md",
                 "mode": "source",
                 "source": false
               },
@@ -185,9 +185,9 @@
   "active": "0eb0757821299dfd",
   "lastOpenFiles": [
     "Сам проект/project.godot3767298.tmp",
-    "План проекта/Class_Json.md",
-    "План проекта/Class_Help.md",
-    "План проекта/Сцена Start_Program.md",
-    "План проекта/Обзор проекта.md"
+    "План_проекта/Class_Json.md",
+    "План_проекта/Class_Help.md",
+    "План_проекта/Сцена Start_Program.md",
+    "План_проекта/Обзор проекта.md"
   ]
 }

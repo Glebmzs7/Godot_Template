@@ -1,6 +1,7 @@
 keys,ru,en,de,fr,es
 SETTINGS_TITLE,Настройки,Settings,Einstellungen,Paramètres,Configuración
 SUPPORT_TITLE,Поддержка,Support,Support,Support,Soporte
+ACCOUNT_PICKER_TITLE,Выбор аккаунта,Select account,Konto auswählen,Choisir un compte,Seleccionar cuenta
 SUPPORT_BODY,Поддержка пока не подключена,Support is not connected yet,Der Support ist noch nicht verbunden,Le support n'est pas encore connecté,El soporte aún no está conectado
 CATEGORY_LANGUAGE,Язык,Language,Sprache,Langue,Idioma
 CATEGORY_SCREEN,Размер окна,Window size,Fenstergröße,Taille de la fenêtre,Tamaño de ventana
